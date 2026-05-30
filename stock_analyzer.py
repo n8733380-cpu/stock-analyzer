@@ -1044,20 +1044,56 @@ def build_chart(df, symbol, fast_col, slow_col, fast_ma, slow_ma, supports, stop
 
 
 # ── 模擬交易 helpers ──────────────────────────────────────────────────────────
-PAPER_FILE = r"D:\私人\股票分析\paper_trades.json"
+PAPER_FILE      = r"D:\私人\股票分析\paper_trades.json"
+SHEET_ID        = "17o-c7bQXcTk53DwRfQGESnCyxjA2owY8D7-NJzurTxQ"
+EMPTY_TRADES    = {"positions": [], "closed": []}
+
+@st.cache_resource
+def _get_gsheet():
+    """回傳 gspread worksheet，失敗回傳 None（fallback 到本機 JSON）"""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_info = dict(st.secrets["gcp_service_account"])
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(SHEET_ID).sheet1
+    except Exception:
+        return None
 
 def _load_trades():
+    ws = _get_gsheet()
+    if ws is not None:
+        try:
+            val = ws.acell("A1").value
+            return json.loads(val) if val else EMPTY_TRADES
+        except Exception:
+            pass
     if not os.path.exists(PAPER_FILE):
-        return {"positions": [], "closed": []}
+        return EMPTY_TRADES
     try:
         with open(PAPER_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"positions": [], "closed": []}
+        return EMPTY_TRADES
 
 def _save_trades(data):
-    with open(PAPER_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    ws = _get_gsheet()
+    if ws is not None:
+        try:
+            ws.update_acell("A1", json.dumps(data, ensure_ascii=False))
+            return
+        except Exception:
+            pass
+    try:
+        with open(PAPER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 @st.cache_data(ttl=300)
 def _fetch_latest_price(symbol):
