@@ -1,0 +1,4 @@
+paper_trades.json
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
