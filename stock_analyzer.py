@@ -98,6 +98,8 @@ def calc_indicators(df, fast_ma, slow_ma, pivot_window, support_lookback):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
+    if df.empty:
+        return df, fast_col, slow_col, []
     cutoff = df.index[-1] - pd.Timedelta(days=support_lookback)
     raw_pivots = _detect_pivot_lows(df[df.index >= cutoff]["Low"], pivot_window)
     supports = _cluster_levels(raw_pivots)
@@ -452,8 +454,9 @@ def run_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
                  if len(daily_ret) > 1 and daily_ret.std() > 0 else 0.0
     peak       = eq_s.cummax()
     max_dd     = float(((eq_s - peak) / peak).min() * 100)
-    bh_ret     = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[0]) - 1) * 100
-    bh_eq      = df["Close"] / float(df["Close"].iloc[0]) * initial_capital
+    first_close = df["Close"].dropna().iloc[0] if not df["Close"].dropna().empty else 1
+    bh_ret     = (float(df["Close"].iloc[-1]) / float(first_close) - 1) * 100
+    bh_eq      = df["Close"] / float(first_close) * initial_capital
 
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
         columns=["入場日","出場日","入場價","出場價","出場類型","持有天數","損益%","損益(元)"]
@@ -1222,10 +1225,10 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     consol_pat = [p for p in patterns if any(k in p for k in ["VCP", "平台底", "杯柄", "雙底"])]
 
     # 過度延伸：1M > 25% 且無整理型態 → 追高風險（閾值與 calc_score 一致）
-    _r1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-22]) - 1) * 100 \
-           if len(df) > 22 else 0
-    _r3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-64]) - 1) * 100 \
-           if len(df) > 64 else 0
+    _r1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-21]) - 1) * 100 \
+           if len(df) > 21 else 0
+    _r3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-63]) - 1) * 100 \
+           if len(df) > 63 else 0
     is_extended = (_r1m > 25 and not consol_pat) or (_r3m > 60 and not consol_pat)
 
     if top_divs:
@@ -1236,7 +1239,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         action = "可買"
     elif trend == "多頭" and (tag == "多頭持續中" or consol_pat):
         action = "等待進場"
-    elif tag == "觀察中" and consol_pat:
+    elif trend == "多頭" and tag == "觀察中" and consol_pat:
         action = "等待進場"
     else:
         action = "不看"
@@ -1494,7 +1497,7 @@ for tab, code in zip(tabs, stock_codes):
             action_q = "不看"
         elif gap_now > 0 and last_q == 1 and days_q <= 5:
             action_q = "可買"
-        elif gap_now > 0 and (_consol_q or last_q == 1):
+        elif gap_now > 0 and (_consol_q or (last_q == 1 and days_q <= 120)):
             action_q = "等待進場"
         else:
             action_q = "不看"
@@ -1513,7 +1516,7 @@ for tab, code in zip(tabs, stock_codes):
         target_pct = round((target_q / close - 1) * 100, 1)
         rsi_q   = round(float(latest["RSI14"]), 1) if "RSI14" in df.columns and pd.notna(latest.get("RSI14")) else None
         score_q = calc_score(df, pats_q, fast_col, slow_col)
-        rr_q    = round((target_q - close) / (close - stop_q), 2) if close > stop_q else None
+        rr_q    = round((target_q - close) / (close - stop_q), 2) if 0 < stop_q < close else None
 
         st.markdown("---")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
