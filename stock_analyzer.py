@@ -1232,12 +1232,12 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         action = "不看"
     elif is_extended:
         action = "不看"
-    elif trend == "多頭" and (tag == "近期黃金交叉" or (consol_pat and tag == "多頭持續中")):
+    elif trend == "多頭" and tag == "近期黃金交叉":
         action = "可買"
     elif trend == "多頭" and (tag == "多頭持續中" or consol_pat):
-        action = "等買"
+        action = "等待進場"
     elif tag == "觀察中" and consol_pat:
-        action = "等買"
+        action = "等待進場"
     else:
         action = "不看"
 
@@ -1492,10 +1492,10 @@ for tab, code in zip(tabs, stock_codes):
             action_q = "不看"
         elif _ext_q:
             action_q = "不看"
-        elif gap_now > 0 and (last_q == 1 and days_q <= 5 or (_consol_q and last_q == 1)):
+        elif gap_now > 0 and last_q == 1 and days_q <= 5:
             action_q = "可買"
-        elif gap_now > 0 and (last_q == 1 or _consol_q):
-            action_q = "等買"
+        elif gap_now > 0 and (_consol_q or last_q == 1):
+            action_q = "等待進場"
         else:
             action_q = "不看"
 
@@ -1518,9 +1518,9 @@ for tab, code in zip(tabs, stock_codes):
         st.markdown("---")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         if action_q == "可買":
-            c1.success("**✅ 可買**")
-        elif action_q == "等買":
-            c1.warning("**⏳ 等買**")
+            c1.success("**✅ 可買（訊號確認）**")
+        elif action_q == "等待進場":
+            c1.warning("**⏳ 等待進場**")
         else:
             c1.error("**❌ 不看**")
         c2.metric("進場價（參考）", f"{close:.2f}", "現價附近")
@@ -1702,7 +1702,7 @@ with tabs[-4]:
         scan_source_key = scan_mode
 
     use_fin_filter = st.toggle(
-        "加入財務篩選（對可買/等買候選股查詢 EPS / 成長率，需額外 1–3 分鐘）",
+        "加入財務篩選（對可買/等待進場候選股查詢 EPS / 成長率，需額外 1–3 分鐘）",
         value=False, key="use_fin_filter"
     )
     col_btn, col_info = st.columns([1, 4])
@@ -1772,7 +1772,7 @@ with tabs[-4]:
             st.session_state["scan_result"] = result_df
             st.session_state["scan_key"] = scan_key
             if use_fin_filter and not result_df.empty:
-                cands = result_df[result_df["操作"].isin(["可買", "等買"])]
+                cands = result_df[result_df["操作"].isin(["可買", "等待進場"])]
                 if not cands.empty:
                     fin_pb = st.progress(0, text="查詢財務數據...")
                     grade_map = {}
@@ -1811,7 +1811,7 @@ with tabs[-4]:
         # ── 簡易操作清單（最頂端）────────────────────────────────────────────────
         if "操作" in result_df.columns:
             buy_now  = result_df[result_df["操作"] == "可買"]
-            wait_buy = result_df[result_df["操作"] == "等買"]
+            wait_buy = result_df[result_df["操作"] == "等待進場"]
             easy_df  = pd.concat([buy_now, wait_buy], ignore_index=True)
             if not easy_df.empty:
                 st.markdown("### 操作建議清單")
@@ -1820,7 +1820,7 @@ with tabs[-4]:
                                           "距52週高%", "偵測型態", "訊號日期"]
                              if c in easy_df.columns]
                 disp = easy_df[show_cols].reset_index(drop=True)
-                disp["操作"] = disp["操作"].map({"可買": "✅ 可買", "等買": "⏳ 等買"}).fillna(disp["操作"])
+                disp["操作"] = disp["操作"].map({"可買": "✅ 可買（訊號確認）", "等待進場": "⏳ 等待進場"}).fillna(disp["操作"])
                 st.dataframe(disp, use_container_width=True, hide_index=True)
                 st.download_button(
                     "下載操作清單 CSV",
