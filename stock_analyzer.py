@@ -124,7 +124,7 @@ def _cluster_levels(pivots, pct=0.02):
     prices = sorted(p for _, p in pivots)
     clusters, group = [], [prices[0]]
     for p in prices[1:]:
-        if abs(p - group[-1]) / group[-1] < pct:
+        if group[-1] > 0 and abs(p - group[-1]) / group[-1] < pct:
             group.append(p)
         else:
             clusters.append(float(np.mean(group)))
@@ -454,9 +454,11 @@ def run_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
                  if len(daily_ret) > 1 and daily_ret.std() > 0 else 0.0
     peak       = eq_s.cummax()
     max_dd     = float(((eq_s - peak) / peak).min() * 100)
-    first_close = df["Close"].dropna().iloc[0] if not df["Close"].dropna().empty else 1
-    bh_ret     = (float(df["Close"].iloc[-1]) / float(first_close) - 1) * 100
-    bh_eq      = df["Close"] / float(first_close) * initial_capital
+    _cl = df["Close"].dropna()
+    first_close = float(_cl.iloc[0]) if not _cl.empty else 1
+    last_close  = float(_cl.iloc[-1]) if not _cl.empty else first_close
+    bh_ret     = (last_close / first_close - 1) * 100
+    bh_eq      = df["Close"] / first_close * initial_capital
 
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
         columns=["入場日","出場日","入場價","出場價","出場類型","持有天數","損益%","損益(元)"]
@@ -1250,7 +1252,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
 
     high_52  = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
-    rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns else None
+    rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
     mom      = _calc_momentum(df)
 
     def _fmt_mom(key):
@@ -1485,10 +1487,10 @@ for tab, code in zip(tabs, stock_codes):
 
         _top_div_q  = [p for p in pats_q if "頂背離" in p]
         _consol_q   = [p for p in pats_q if any(k in p for k in ["VCP", "平台底", "杯柄", "雙底"])]
-        _r1m_q = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-22]) - 1) * 100 \
-                 if len(df) > 22 else 0
-        _r3m_q = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-64]) - 1) * 100 \
-                 if len(df) > 64 else 0
+        _r1m_q = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-21]) - 1) * 100 \
+                 if len(df) > 21 else 0
+        _r3m_q = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-63]) - 1) * 100 \
+                 if len(df) > 63 else 0
         _ext_q = (_r1m_q > 25 and not _consol_q) or (_r3m_q > 60 and not _consol_q)
 
         if _top_div_q:
@@ -1497,7 +1499,7 @@ for tab, code in zip(tabs, stock_codes):
             action_q = "不看"
         elif gap_now > 0 and last_q == 1 and days_q <= 5:
             action_q = "可買"
-        elif gap_now > 0 and (_consol_q or (last_q == 1 and days_q <= 120)):
+        elif gap_now > 0 and (_consol_q or (last_q == 1 and days_q <= 60)):
             action_q = "等待進場"
         else:
             action_q = "不看"
@@ -1714,7 +1716,7 @@ with tabs[-4]:
     with col_info:
         st.info(f"快線 MA{fast_ma} vs 慢線 MA{slow_ma}，止損 {stop_pct}%，期間 {period}")
 
-    scan_key = f"{scan_source_key}|{suffix}|{period}|{fast_ma}|{slow_ma}|{stop_pct}|fin={use_fin_filter}"
+    scan_key = f"{scan_source_key}|{suffix}|{period}|{fast_ma}|{slow_ma}|{stop_pct}|atr={use_atr_stop}|fin={use_fin_filter}"
     need_scan = (
         force_rescan
         or "scan_result" not in st.session_state
@@ -1792,9 +1794,9 @@ with tabs[-4]:
                     )
                     st.session_state["scan_result"] = result_df
     else:
-        result_df = st.session_state["scan_result"]
+        result_df = st.session_state.get("scan_result", pd.DataFrame())
 
-    if "scan_result" in st.session_state and not result_df.empty:
+    if not result_df.empty:
         if "財務" in result_df.columns:
             if st.checkbox("排除財務虧損股", value=True, key="excl_fin_risk"):
                 result_df = result_df[~result_df["財務"].str.contains("虧損", na=False)]
@@ -1857,22 +1859,22 @@ with tabs[-4]:
 
         if not entry_df.empty:
             st.markdown("#### 近期黃金交叉（最值得關注）")
-            st.dataframe(entry_df.drop(columns="排列").reset_index(drop=True),
+            st.dataframe(entry_df.drop(columns="排列", errors="ignore").reset_index(drop=True),
                          use_container_width=True, hide_index=True)
 
         if not bull_df.empty:
             st.markdown("#### 多頭排列持續中")
-            st.dataframe(bull_df.drop(columns="排列").reset_index(drop=True),
+            st.dataframe(bull_df.drop(columns="排列", errors="ignore").reset_index(drop=True),
                          use_container_width=True, hide_index=True)
 
         if not watch_df.empty:
             with st.expander(f"觀察中（{len(watch_df)} 支）"):
-                st.dataframe(watch_df.drop(columns="排列").reset_index(drop=True),
+                st.dataframe(watch_df.drop(columns="排列", errors="ignore").reset_index(drop=True),
                              use_container_width=True, hide_index=True)
 
         if not exit_df.empty:
             with st.expander(f"空頭 / 近期死亡交叉（{len(exit_df)} 支，避開）"):
-                st.dataframe(exit_df.drop(columns="排列").reset_index(drop=True),
+                st.dataframe(exit_df.drop(columns="排列", errors="ignore").reset_index(drop=True),
                              use_container_width=True, hide_index=True)
 
         st.caption(f"共掃描 {len(result_df)} 支，資料來自 Yahoo Finance，僅供參考，不構成投資建議。")
@@ -2269,7 +2271,10 @@ with tabs[-1]:
 
         if close_btn and sell_price > 0:
             sel_id = pos_opts[sel_label]
-            pos    = next(p for p in positions if p["id"] == sel_id)
+            pos    = next((p for p in positions if p["id"] == sel_id), None)
+            if pos is None:
+                st.error("找不到該部位，請重新整理頁面")
+                st.stop()
             pnl    = (sell_price - pos["buy_price"]) * pos["shares"] * 1000
             closed.append({**pos, "sell_date": str(sell_date), "sell_price": float(sell_price)})
             data["positions"] = [p for p in positions if p["id"] != sel_id]
