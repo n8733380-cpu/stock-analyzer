@@ -1563,7 +1563,7 @@ for tab, code in zip(tabs, stock_codes):
         }
         _fn_method, _fn_label = _FIN_STYLE.get(grade, ("info", grade))
         _exp_title = f"財務健康：{_fn_label}"
-        if _sector_label != "—":
+        if _sector_label and _sector_label not in ("—", ""):
             _exp_title += f"　｜　產業：{_sector_label}"
         with st.expander(_exp_title, expanded=(grade in ("虧損", "衰退"))):
             _fc = st.columns(5)
@@ -1636,20 +1636,28 @@ for tab, code in zip(tabs, stock_codes):
             getattr(st, _fn)(f"GMM 市場狀態：{_txt}")
 
         # ── 進場策略 + 失效條件 ──────────────────────────────────────────────────
-        agg, cons, fails = _build_strategy(
+        _, _, fails = _build_strategy(
             close, stop_q, supports, fast_col, slow_col, df, fast_ma, slow_ma
         )
         with st.expander("進場策略與失效條件", expanded=True):
-            sa, sb = st.columns(2)
-            with sa:
-                st.markdown("**積極進場**")
-                st.info(agg)
-                st.markdown("**保守進場**")
-                st.success(cons)
-            with sb:
-                st.markdown("**失效條件**")
+            if action_q == "不看":
+                st.warning("目前訊號為「不看」，不建議進場。留意以下失效條件作為參考。")
                 for f in fails:
                     st.error(f)
+            else:
+                agg, cons, _ = _build_strategy(
+                    close, stop_q, supports, fast_col, slow_col, df, fast_ma, slow_ma
+                )
+                sa, sb = st.columns(2)
+                with sa:
+                    st.markdown("**積極進場**")
+                    st.info(agg)
+                    st.markdown("**保守進場**")
+                    st.success(cons)
+                with sb:
+                    st.markdown("**失效條件**")
+                    for f in fails:
+                        st.error(f)
 
         col_l, col_r = st.columns(2)
 
@@ -2262,10 +2270,11 @@ with tabs[-1]:
             f"{p['code']}  買@{p['buy_price']}  ({p['buy_date']})  ×{p['shares']}張": p["id"]
             for p in positions
         }
+        _default_sell = float(positions[0]["buy_price"]) if positions else 1.0
         with st.form("close_pos"):
             sel_label  = st.selectbox("選擇持倉", list(pos_opts.keys()))
             cc1, cc2   = st.columns(2)
-            sell_price = cc1.number_input("賣出價格", min_value=0.01, step=0.5, format="%.2f")
+            sell_price = cc1.number_input("賣出價格", min_value=0.01, value=_default_sell, step=0.5, format="%.2f")
             sell_date  = cc2.date_input("賣出日期", value=pd.Timestamp.today())
             close_btn  = st.form_submit_button("確認出場", use_container_width=True)
 
