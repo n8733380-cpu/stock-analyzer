@@ -1195,7 +1195,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     if len(stock_df) < max(slow_ma + 10, 40):
         return None
 
-    df, fast_col, slow_col, _ = calc_indicators(stock_df, fast_ma, slow_ma, 7, 120)
+    df, fast_col, slow_col, supports = calc_indicators(stock_df, fast_ma, slow_ma, 7, 120)
 
     latest  = df.iloc[-1]
     close   = float(latest["Close"])
@@ -1246,8 +1246,19 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     else:
         action = "不看"
 
-    stop_val = round(close * (1 - stop_pct / 100), 2)
-    rs_val   = _calc_rs(df, bench_df) if bench_df is not None else None
+    stop_val   = round(close * (1 - stop_pct / 100), 2)
+    rs_val     = _calc_rs(df, bench_df) if bench_df is not None else None
+    resist     = [s for s in (supports or []) if s > close]
+    target_val = round(min(resist), 2) if resist else round(close * 1.15, 2)
+    rr_val     = round((target_val - close) / (close - stop_val), 2) if 0 < stop_val < close else None
+
+    # 方案B過濾：相對強度過弱或RR不足 → 可買降為等待進場
+    if action == "可買":
+        if rs_val is not None and rs_val < -15:
+            action = "等待進場"
+        elif rr_val is not None and rr_val < 1.5:
+            action = "等待進場"
+
     score    = calc_score(df, patterns, fast_col, slow_col, rs_val)
 
     high_52  = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
@@ -1271,6 +1282,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         "1M%": _fmt_mom("R1M"),
         "3M%": _fmt_mom("R3M"),
         "距52週高%": f"{dist_52h:+.1f}%" if dist_52h is not None else "—",
+        "RR": f"1:{rr_val:.1f}" if rr_val is not None else "—",
         "偵測型態": "、".join(patterns) if patterns else "—",
         "狀態": tag,
         "最近訊號": last_sig,
@@ -1829,7 +1841,7 @@ with tabs[-4]:
             if not easy_df.empty:
                 st.markdown("### 操作建議清單")
                 show_cols = [c for c in ["分數", "操作", "財務", "代號", "產業", "收盤價", "止損價",
-                                          "RSI", "RS vs大盤", "RS vs產業", "1M%", "3M%",
+                                          "RR", "RSI", "RS vs大盤", "RS vs產業", "1M%", "3M%",
                                           "距52週高%", "偵測型態", "訊號日期"]
                              if c in easy_df.columns]
                 disp = easy_df[show_cols].reset_index(drop=True)
