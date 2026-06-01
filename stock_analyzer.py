@@ -1197,6 +1197,12 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
 
     df, fast_col, slow_col, supports = calc_indicators(stock_df, fast_ma, slow_ma, 7, 120)
 
+    # 成交量過濾：20日均量 < 500張 或 均金額 < 500萬 → 跳過
+    avg_vol = df["Volume"].tail(20).mean() if "Volume" in df.columns else 0
+    latest_close = float(df["Close"].iloc[-1]) if not df.empty else 0
+    if avg_vol < 500 or (avg_vol * latest_close) < 5_000_000:
+        return None
+
     latest  = df.iloc[-1]
     close   = float(latest["Close"])
     gap_now = float(latest[fast_col]) - float(latest[slow_col])
@@ -1529,7 +1535,9 @@ for tab, code in zip(tabs, stock_codes):
         target_q = round(min(resist_q), 2) if resist_q else round(close * 1.15, 2)
         target_pct = round((target_q / close - 1) * 100, 1)
         rsi_q   = round(float(latest["RSI14"]), 1) if "RSI14" in df.columns and pd.notna(latest.get("RSI14")) else None
-        score_q = calc_score(df, pats_q, fast_col, slow_col)
+        _bench_q = _fetch_benchmark(period)
+        rs_q     = _calc_rs(df, _bench_q)
+        score_q  = calc_score(df, pats_q, fast_col, slow_col, rs_q)
         rr_q    = round((target_q - close) / (close - stop_q), 2) if 0 < stop_q < close else None
 
         st.markdown("---")
