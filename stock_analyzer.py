@@ -1170,10 +1170,17 @@ def fetch_sector_map(suffix):
 # ── 批次下載（100支一批，速度遠快於逐支下載）────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_multi(symbols_tuple, period):
+    import concurrent.futures
     syms = list(symbols_tuple)
-    df = yf.download(syms, period=period, auto_adjust=True,
-                     progress=False, group_by="ticker", threads=True)
-    return df
+    def _dl():
+        return yf.download(syms, period=period, auto_adjust=True,
+                           progress=False, group_by="ticker", threads=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_dl)
+        try:
+            return fut.result(timeout=60)
+        except concurrent.futures.TimeoutError:
+            return pd.DataFrame()
 
 def _extract_one(multi_df, symbol, n_syms):
     if not isinstance(multi_df.columns, pd.MultiIndex):
@@ -1299,8 +1306,9 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
 
 # ── 掃描主函式（批次下載版）────────────────────────────────────────────────────
 def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=None, sector_map=None):
+    import time
     results = []
-    batch_size = 100
+    batch_size = 50 if suffix == ".TWO" else 100
     total = len(codes)
 
     for i in range(0, total, batch_size):
@@ -1314,6 +1322,9 @@ def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=
             multi = fetch_multi(tuple(batch_syms), period)
         except Exception:
             continue
+
+        if suffix == ".TWO":
+            time.sleep(0.5)
 
         for code, sym in zip(batch_codes, batch_syms):
             try:
