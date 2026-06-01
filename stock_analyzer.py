@@ -1657,7 +1657,7 @@ for tab, code in zip(tabs, stock_codes):
                 st.metric(f"相對強度 vs 0050（近3月）", f"{rs_val:+.1f}%",
                           rs_label, delta_color=clr)
         with row_info[2]:
-            _regime = _detect_regime(df)
+            _regime = _detect_regime(bench_df)  # 用 0050 大盤資料，不是個股
             _REGIME_STYLE = {
                 "多頭": ("success", "多頭 — 趨勢順風"),
                 "橫盤": ("info",    "橫盤 — 謹慎操作"),
