@@ -1145,6 +1145,17 @@ def _parse_isin_page(mode):
 @st.cache_data(ttl=43200)
 def fetch_twse_codes():
     try:
+        import twstock
+        codes = [
+            code for code, info in twstock.codes.items()
+            if getattr(info, 'market', '') == '上市'
+            and ((len(code) == 4 and code[0] != '0') or code.startswith('00'))
+        ]
+        if codes:
+            return sorted(set(codes))
+    except Exception:
+        pass
+    try:
         codes, _ = _parse_isin_page(2)
         return codes
     except Exception:
@@ -1152,6 +1163,17 @@ def fetch_twse_codes():
 
 @st.cache_data(ttl=43200)
 def fetch_tpex_codes():
+    try:
+        import twstock
+        codes = [
+            code for code, info in twstock.codes.items()
+            if getattr(info, 'market', '') == '上櫃'
+            and ((len(code) == 4 and code[0] != '0') or code.startswith('00'))
+        ]
+        if codes:
+            return sorted(set(codes))
+    except Exception:
+        pass
     try:
         codes, _ = _parse_isin_page(4)
         return codes
