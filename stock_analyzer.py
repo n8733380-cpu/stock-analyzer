@@ -6,6 +6,52 @@ from plotly.subplots import make_subplots
 import numpy as np
 import requests
 import json, os, uuid as _uuid
+import time as _time
+
+@st.cache_data(ttl=3600)
+def _fetch_institutional_data():
+    """從 TWSE T86 抓最近 5 個交易日外資買賣超，回傳 {code: {'consec': N, 'total': X(股)}}"""
+    from datetime import datetime as _dt, timedelta as _td
+    daily = {}
+    d = _dt.today()
+    while len(daily) < 5:
+        d -= _td(days=1)
+        ds = d.strftime("%Y%m%d")
+        try:
+            url = (f"https://www.twse.com.tw/fund/T86"
+                   f"?response=json&date={ds}&selectType=ALLBUT0999")
+            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            data = r.json()
+            if data.get("stat") == "OK":
+                out = {}
+                for row in data["data"]:
+                    code = row[0].strip()
+                    if len(code) == 4 and code.isdigit():
+                        try:
+                            out[code] = int(row[4].replace(",", "").strip())
+                        except Exception:
+                            pass
+                daily[ds] = out
+        except Exception:
+            pass
+        _time.sleep(0.3)
+    dates = sorted(daily.keys())
+    all_codes = set().union(*[set(v.keys()) for v in daily.values()])
+    result = {}
+    for code in all_codes:
+        consec = 0
+        total = 0
+        for date in reversed(dates):
+            net = daily[date].get(code, 0)
+            if net > 0:
+                consec += 1
+                total += net
+            else:
+                break
+        if consec > 0:
+            result[code] = {"consec": consec, "total": total}
+    return result
+
 
 st.set_page_config(page_title="台股技術分析", layout="wide")
 st.title("台股均線分析儀表板")
@@ -161,73 +207,105 @@ def _calc_macd(close, fast=12, slow=26, signal=9):
 
 
 def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
-    """綜合評分 0-100（均線排列＋RSI＋量能＋型態＋52週位置＋訊號＋RS）"""
-    score  = 0
+    """
+    綜合評分 0-100。
+    核心邏輯：訊號時機（35分）主導分數，量能確認（20分）次之，
+    其餘為輔助加減分。空頭排列直接回傳 0；頂背離或過度延伸上限 40。
+    """
     latest = df.iloc[-1]
     close  = float(latest["Close"])
 
-    mas = [float(latest[f"MA{x}"]) for x in [5, 10, 20, 60]]
-    if all(mas[i] > mas[i + 1] for i in range(3)):
-        score += 25
-    elif float(latest[fast_col]) > float(latest[slow_col]):
-        score += 12
+    # 空頭排列直接 0
+    if float(latest[fast_col]) <= float(latest[slow_col]):
+        return 0
 
-    if "RSI14" in df.columns and pd.notna(latest.get("RSI14")):
-        rsi = float(latest["RSI14"])
-        if 50 <= rsi <= 70:
-            score += 20
-        elif 45 <= rsi < 50 or 70 < rsi <= 75:
-            score += 10
-
-    vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
-    if pd.notna(vol_avg):
-        if float(latest["Volume"]) > vol_avg * 1.5:
-            score += 15
-        elif float(latest["Volume"]) > vol_avg:
-            score += 8
-
-    # 正面型態加分；頂背離扣分（不能混在一起）
-    pos_pats = [p for p in patterns if "頂背離" not in p]
     top_divs = [p for p in patterns if "頂背離" in p]
-    score += min(20, len(pos_pats) * 10)
-    score -= len(top_divs) * 15
+    rsi_now  = float(latest["RSI14"]) if "RSI14" in df.columns and pd.notna(latest.get("RSI14")) else 50
+    r1m      = float(df["R1M"].iloc[-1]) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else 0
 
-    high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
-    if close >= high_52 * 0.90:
-        score += 10
-    elif close >= high_52 * 0.80:
-        score += 5
+    score = 0
 
+    # ── 訊號時機（35分）：黃金交叉距今幾天，越近越高分 ──────────────
     sig_df = df[df["signal"] == 1]
     if not sig_df.empty:
         days_since = (df.index[-1] - sig_df.iloc[-1].name).days
-        if days_since <= 5:
+        if days_since <= 2:
+            score += 35
+        elif days_since <= 5:
+            score += 28
+        elif days_since <= 10:
+            score += 18
+        elif days_since <= 20:
             score += 10
-        elif days_since <= 15:
-            score += 5
+        elif days_since <= 45:
+            score += 4
 
-    # 動能因子：健康動能加分，過度延伸（1M > 25%）不加分
-    if "R1M" in df.columns and pd.notna(latest.get("R1M")):
-        r1m = float(latest["R1M"])
-        if 5 < r1m <= 25:
-            score += 10
-        elif 0 < r1m <= 5:
-            score += 5
+    # ── 量能確認（20分）────────────────────────────────────────────
+    vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+    if pd.notna(vol_avg) and float(vol_avg) > 0:
+        vol_ratio = float(latest["Volume"]) / float(vol_avg)
+        if vol_ratio >= 2.0:
+            score += 20
+        elif vol_ratio >= 1.5:
+            score += 14
+        elif vol_ratio >= 1.0:
+            score += 7
+        elif vol_ratio >= 0.7:
+            score += 2
 
-    # 先截頂，再套 RS 調整（確保 RS 扣分不被基礎分的溢出吸收）
-    score = max(0, min(100, score))
+    # ── 型態訊號（20分）────────────────────────────────────────────
+    pos_pats = [p for p in patterns if "頂背離" not in p]
+    PAT_W = {"VCP": 12, "杯柄": 10, "雙底": 9, "平台底": 7, "OBV底背離": 8, "RSI底背離": 5}
+    pat_score = sum(w for k, w in PAT_W.items() if any(k in p for p in pos_pats))
+    score += min(20, pat_score)
 
+    # 頂背離重罰（每個 -20）
+    score -= len(top_divs) * 20
+
+    # ── RSI 位置（10分）────────────────────────────────────────────
+    if 52 <= rsi_now <= 65:
+        score += 10
+    elif (45 <= rsi_now < 52) or (65 < rsi_now <= 72):
+        score += 5
+    elif rsi_now > 75:
+        score -= 10
+
+    # ── 1M 動能品質（10分）─────────────────────────────────────────
+    if 3 < r1m <= 15:
+        score += 10
+    elif 0 < r1m <= 3 or 15 < r1m <= 25:
+        score += 5
+    elif r1m > 30:
+        score -= 8
+
+    # ── 相對強度 vs 0050（10分）────────────────────────────────────
     if rs_val is not None:
-        if rs_val >= 10:
-            score = min(100, score + 10)
+        if rs_val >= 15:
+            score += 10
+        elif rs_val >= 5:
+            score += 6
         elif rs_val >= 0:
-            score = min(100, score + 5)
-        elif rs_val <= -10:
-            score -= 10
+            score += 2
+        elif rs_val <= -15:
+            score -= 12
         elif rs_val <= -5:
-            score -= 5
+            score -= 6
 
-    return max(0, score)
+    # ── 52週位置（5分）─────────────────────────────────────────────
+    high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
+    if float(high_52) > 0:
+        dist_pct = (close / float(high_52) - 1) * 100
+        if -8 <= dist_pct <= 0:
+            score += 5   # 接近前高，突破點
+        elif -20 <= dist_pct < -8:
+            score += 3
+        elif dist_pct < -40:
+            score -= 3
+
+    # 頂背離或過度延伸 → 分數上限 40
+    cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
+
+    return max(0, min(cap, score))
 
 
 def _calc_max_drawdown(df):
@@ -1180,8 +1258,21 @@ def fetch_tpex_codes():
     except Exception:
         return []
 
+@st.cache_data(ttl=43200)
 def fetch_sector_map(suffix):
-    """根據 suffix 回傳 {代號: 產業別} 對照表"""
+    """根據 suffix 回傳 {代號: 產業別} 對照表，優先用 twstock.group"""
+    try:
+        import twstock
+        market = '上市' if suffix == '.TW' else '上櫃'
+        smap = {
+            code: getattr(info, 'group', '—')
+            for code, info in twstock.codes.items()
+            if getattr(info, 'market', '') == market and getattr(info, 'group', '')
+        }
+        if smap:
+            return smap
+    except Exception:
+        pass
     mode = 2 if suffix == ".TW" else 4
     try:
         _, smap = _parse_isin_page(mode)
@@ -1771,13 +1862,17 @@ with tabs[-4]:
         "加入財務篩選（對可買/等待進場候選股查詢 EPS / 成長率，需額外 1–3 分鐘）",
         value=False, key="use_fin_filter"
     )
+    use_inst_filter = st.toggle(
+        "加入法人籌碼（外資連續買超優先排序，需額外 30 秒）",
+        value=False, key="use_inst_filter"
+    )
     col_btn, col_info = st.columns([1, 4])
     with col_btn:
         force_rescan = st.button("重新掃描", use_container_width=True)
     with col_info:
         st.info(f"快線 MA{fast_ma} vs 慢線 MA{slow_ma}，止損 {stop_pct}%，期間 {period}")
 
-    scan_key = f"{scan_source_key}|{suffix}|{period}|{fast_ma}|{slow_ma}|{stop_pct}|atr={use_atr_stop}|fin={use_fin_filter}"
+    scan_key = f"{scan_source_key}|{suffix}|{period}|{fast_ma}|{slow_ma}|{stop_pct}|atr={use_atr_stop}|fin={use_fin_filter}|inst={use_inst_filter}"
     need_scan = (
         force_rescan
         or "scan_result" not in st.session_state
@@ -1835,6 +1930,18 @@ with tabs[-4]:
                     _fmt_rs_sector(v, s)
                     for v, s in zip(_tmp, result_df["產業"])
                 ]
+            # ── 法人籌碼合併 ────────────────────────────────────────────────────
+            if use_inst_filter:
+                with st.spinner("取得三大法人籌碼資料（TWSE T86）..."):
+                    inst_data = _fetch_institutional_data()
+                if inst_data:
+                    result_df["連買天"] = result_df["代號"].map(
+                        lambda c: inst_data.get(c, {}).get("consec", 0)
+                    )
+                    result_df["外資累計(張)"] = result_df["代號"].map(
+                        lambda c: inst_data.get(c, {}).get("total", 0) // 1000
+                    )
+
             st.session_state["scan_result"] = result_df
             st.session_state["scan_key"] = scan_key
             if use_fin_filter and not result_df.empty:
@@ -1880,8 +1987,14 @@ with tabs[-4]:
             wait_buy = result_df[result_df["操作"] == "等待進場"]
             easy_df  = pd.concat([buy_now, wait_buy], ignore_index=True)
             if not easy_df.empty:
-                st.markdown("### 操作建議清單")
-                show_cols = [c for c in ["分數", "操作", "財務", "代號", "產業", "收盤價", "止損價",
+                _top_n = st.slider("顯示前幾名", 10, 50, 20, key="top_n_slider")
+                st.markdown(f"### 操作建議清單（前 {_top_n} 名，依分數排序）")
+                # 有法人資料時，在操作清單內按連買天降序排
+                if "連買天" in easy_df.columns:
+                    easy_df = easy_df.sort_values(["連買天", "分數"], ascending=[False, False])
+                easy_df = easy_df.head(_top_n)
+                show_cols = [c for c in ["分數", "操作", "財務", "連買天", "外資累計(張)",
+                                          "代號", "產業", "收盤價", "止損價",
                                           "RR", "RSI", "RS vs大盤", "RS vs產業", "1M%", "3M%",
                                           "距52週高%", "偵測型態", "訊號日期"]
                              if c in easy_df.columns]
