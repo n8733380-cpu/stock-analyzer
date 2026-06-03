@@ -2,13 +2,13 @@ name: 台股每日掃描
 
 on:
   schedule:
-    - cron: '30 9 * * 1-5'  # 09:30 UTC = 17:30 台灣時間（T86 發布後）
+    - cron: '0 10 * * 1-5'  # 10:00 UTC = 18:00 台灣時間（T86 發布後 30 分鐘）
   workflow_dispatch:         # 允許手動觸發
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout

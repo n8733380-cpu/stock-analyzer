@@ -8,6 +8,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 import concurrent.futures
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import yfinance as yf
 import pandas as pd
@@ -513,7 +515,8 @@ def scan_stocks(codes, bench_df, sector_map):
 
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
 def send_email(df, total_scanned):
-    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    _days = ["一", "二", "三", "四", "五", "六", "日"]
+    today = datetime.now().strftime("%Y-%m-%d") + f"（週{_days[datetime.now().weekday()]}）"
     n     = len(df)
 
     if df.empty:
