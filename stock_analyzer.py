@@ -1308,7 +1308,7 @@ def _extract_one(multi_df, symbol, n_syms):
         return None
 
 # ── 分析單支股票並回傳結果列 ──────────────────────────────────────────────────
-def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sector="—"):
+def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sector="—", use_atr_stop=False, atr_mult=2.0):
     stock_df = stock_df.copy()
     stock_df.index = pd.to_datetime(stock_df.index)
     stock_df = stock_df.dropna(subset=["Close"])
@@ -1372,7 +1372,12 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     else:
         action = "不看"
 
-    stop_val   = round(close * (1 - stop_pct / 100), 2)
+    if use_atr_stop and "ATR14" in df.columns and pd.notna(df["ATR14"].iloc[-1]):
+        atr_now  = float(df["ATR14"].iloc[-1])
+        _atr_stop = round(close - atr_mult * atr_now, 2)
+        stop_val  = _atr_stop if 0 < _atr_stop < close else round(close * (1 - stop_pct / 100), 2)
+    else:
+        stop_val  = round(close * (1 - stop_pct / 100), 2)
     rs_val     = _calc_rs(df, bench_df) if bench_df is not None else None
     resist     = [s for s in (supports or []) if s > close]
     target_val = round(min(resist), 2) if resist else round(close * 1.15, 2)
@@ -1418,7 +1423,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     }
 
 # ── 掃描主函式（批次下載版）────────────────────────────────────────────────────
-def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=None, sector_map=None):
+def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=None, sector_map=None, use_atr_stop=False, atr_mult=2.0):
     import time
     results = []
     batch_size = 50 if suffix == ".TWO" else 100
@@ -1445,7 +1450,8 @@ def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=
                 if sdf is None:
                     continue
                 row = _analyze_one(code, sdf, fast_ma, slow_ma, stop_pct, bench_df=bench_df,
-                                   sector=sector_map.get(code, "—") if sector_map else "—")
+                                   sector=sector_map.get(code, "—") if sector_map else "—",
+                                   use_atr_stop=use_atr_stop, atr_mult=atr_mult)
                 if row:
                     results.append(row)
             except Exception:
@@ -1911,7 +1917,8 @@ with tabs[-4]:
             _bench       = _fetch_benchmark(period)
             _sector_map  = fetch_sector_map(suffix)
             result_df = scan_stocks(scan_codes, suffix, period, fast_ma, slow_ma, stop_pct, pb,
-                                    bench_df=_bench, sector_map=_sector_map)
+                                    bench_df=_bench, sector_map=_sector_map,
+                                    use_atr_stop=use_atr_stop, atr_mult=atr_mult)
             pb.empty()
             # RS vs 產業（方案二：同類股掃描結果中位數）
             if "產業" in result_df.columns and "3M%" in result_df.columns:
