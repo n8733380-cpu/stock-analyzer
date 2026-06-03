@@ -14,7 +14,7 @@ def _fetch_institutional_data():
     from datetime import datetime as _dt, timedelta as _td
     daily = {}
     d = _dt.today()
-    while len(daily) < 5:
+    while len(daily) < 5 and (_dt.today() - d).days < 60:
         d -= _td(days=1)
         ds = d.strftime("%Y%m%d")
         try:
@@ -1863,7 +1863,7 @@ with tabs[-4]:
         value=False, key="use_fin_filter"
     )
     use_inst_filter = st.toggle(
-        "加入法人籌碼（外資連續買超優先排序，需額外 30 秒）",
+        "加入法人籌碼（外資連續買超優先排序）",
         value=False, key="use_inst_filter"
     )
     col_btn, col_info = st.columns([1, 4])
@@ -1902,6 +1902,10 @@ with tabs[-4]:
         if not scan_codes:
             st.warning("掃描清單是空的")
         else:
+            inst_data = {}
+            if use_inst_filter:
+                with st.spinner("取得三大法人籌碼資料（TWSE T86）..."):
+                    inst_data = _fetch_institutional_data()
             st.caption(f"共 {len(scan_codes)} 支，每 100 支一批下載，請稍候...")
             pb = st.progress(0, text="準備中...")
             _bench       = _fetch_benchmark(period)
@@ -1931,10 +1935,7 @@ with tabs[-4]:
                     for v, s in zip(_tmp, result_df["產業"])
                 ]
             # ── 法人籌碼合併 ────────────────────────────────────────────────────
-            if use_inst_filter:
-                with st.spinner("取得三大法人籌碼資料（TWSE T86）..."):
-                    inst_data = _fetch_institutional_data()
-                if inst_data:
+            if use_inst_filter and inst_data:
                     result_df["連買天"] = result_df["代號"].map(
                         lambda c: inst_data.get(c, {}).get("consec", 0)
                     )
