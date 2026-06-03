@@ -1,0 +1,602 @@
+"""
+daily_scan.py — 每日收盤後自動掃描台股，結果寄至 Gmail
+建議排程時間：18:00（T86 法人資料約 17:30 發布）
+執行時間：約 10-15 分鐘（TWSE 全市場約 900 支）
+"""
+import os, sys, smtplib, time, requests, re
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+import concurrent.futures
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+# ── 設定 ─────────────────────────────────────────────────────────────────────
+GMAIL_USER   = "n8733380@gmail.com"
+GMAIL_APP_PW = os.environ.get("GMAIL_APP_PW", "")  # 從環境變數讀取
+TO_EMAIL     = "n8733380@gmail.com"
+
+FAST_MA  = 20
+SLOW_MA  = 60
+STOP_PCT = 8
+PERIOD   = "1y"
+SUFFIX   = ".TW"
+MIN_SCORE = 50
+TOP_N     = 15
+
+# ── 進度列替代（print）────────────────────────────────────────────────────────
+class _Progress:
+    def progress(self, pct, text=""):
+        print(f"\r  {text}", end="", flush=True)
+
+# ── 法人籌碼（T86）────────────────────────────────────────────────────────────
+def _fetch_institutional_data():
+    daily = {}
+    d = datetime.today()
+    while len(daily) < 5 and (datetime.today() - d).days < 60:
+        d -= timedelta(days=1)
+        ds = d.strftime("%Y%m%d")
+        try:
+            url = (f"https://www.twse.com.tw/fund/T86"
+                   f"?response=json&date={ds}&selectType=ALLBUT0999")
+            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            data = r.json()
+            if data.get("stat") == "OK":
+                out = {}
+                for row in data["data"]:
+                    code = row[0].strip()
+                    if len(code) == 4 and code.isdigit():
+                        try:
+                            out[code] = int(row[4].replace(",", "").strip())
+                        except Exception:
+                            pass
+                daily[ds] = out
+        except Exception:
+            pass
+        time.sleep(0.3)
+    dates = sorted(daily.keys())
+    all_codes = set().union(*[set(v.keys()) for v in daily.values()])
+    result = {}
+    for code in all_codes:
+        consec = 0
+        total = 0
+        for date in reversed(dates):
+            net = daily[date].get(code, 0)
+            if net > 0:
+                consec += 1
+                total += net
+            else:
+                break
+        if consec > 0:
+            result[code] = {"consec": consec, "total": total}
+    return result
+
+# ── 股票代號清單 ───────────────────────────────────────────────────────────────
+def _parse_isin_page(mode):
+    url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+    r = requests.get(url, timeout=20, verify=False)
+    html = r.content.decode("cp950", errors="ignore")
+    rows = re.findall(
+        r"<td bgcolor=#[A-F0-9]+>(\d+)　[^<]*</td>"
+        r"(?:<td[^>]*>[^<]*</td>){3}"
+        r"<td bgcolor=#[A-F0-9]+>([^<]*)</td>",
+        html
+    )
+    exclude = ["權", "轉換", "存託", "特別", "債"]
+    result, smap = [], {}
+    for code, sec_type in rows:
+        if any(x in sec_type for x in exclude):
+            continue
+        if (len(code) == 4 and code[0] != "0") or code.startswith("00"):
+            result.append(code)
+            smap[code] = sec_type.strip()
+    return sorted(set(result)), smap
+
+def fetch_twse_codes():
+    try:
+        import twstock
+        codes = [
+            code for code, info in twstock.codes.items()
+            if getattr(info, "market", "") == "上市"
+            and ((len(code) == 4 and code[0] != "0") or code.startswith("00"))
+        ]
+        if codes:
+            return sorted(set(codes))
+    except Exception:
+        pass
+    try:
+        codes, _ = _parse_isin_page(2)
+        return codes
+    except Exception:
+        return []
+
+def fetch_sector_map():
+    try:
+        import twstock
+        smap = {
+            code: getattr(info, "group", "—")
+            for code, info in twstock.codes.items()
+            if getattr(info, "market", "") == "上市" and getattr(info, "group", "")
+        }
+        if smap:
+            return smap
+    except Exception:
+        pass
+    try:
+        _, smap = _parse_isin_page(2)
+        return smap
+    except Exception:
+        return {}
+
+# ── 技術指標 ──────────────────────────────────────────────────────────────────
+def calc_indicators(df, fast_ma, slow_ma):
+    df = df.copy()
+    for ma in [5, 10, 20, 60]:
+        df[f"MA{ma}"] = df["Close"].rolling(ma).mean()
+    fast_col = f"MA{fast_ma}"
+    slow_col = f"MA{slow_ma}"
+    df["gap"]      = df[fast_col] - df[slow_col]
+    df["gap_prev"] = df["gap"].shift(1)
+    df["signal"]   = 0
+    df.loc[(df["gap"] > 0) & (df["gap_prev"] <= 0), "signal"] = 1
+    df.loc[(df["gap"] < 0) & (df["gap_prev"] >= 0), "signal"] = -1
+    direction    = np.sign(df["Close"].diff().fillna(0))
+    df["OBV"]    = (direction * df["Volume"]).cumsum()
+    for n, label in [(21, "R1M"), (63, "R3M"), (126, "R6M")]:
+        df[label] = (df["Close"] / df["Close"].shift(n) - 1) * 100
+    delta = df["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    df["RSI14"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+    return df, fast_col, slow_col
+
+# ── 型態偵測 ──────────────────────────────────────────────────────────────────
+def _detect_vcp(c, v):
+    n = len(c)
+    if n < 40:
+        return None
+    w = 5
+    ph, pl = [], []
+    for i in range(w, n - w):
+        seg = c[i-w:i+w+1]
+        if c[i] >= max(seg) - 1e-9:
+            ph.append(i)
+        elif c[i] <= min(seg) + 1e-9:
+            pl.append(i)
+    if len(ph) < 2 or len(pl) < 2:
+        return None
+    corrs = []
+    for hi in ph:
+        nxt = [li for li in pl if li > hi]
+        if not nxt:
+            continue
+        li = nxt[0]
+        pct = (c[hi] - c[li]) / c[hi] * 100
+        avg_v = float(np.mean(v[max(0, li-3):li+4]))
+        corrs.append((pct, avg_v))
+    if len(corrs) < 3:
+        return None
+    recent = corrs[-4:]
+    shrink = all(recent[i][0] > recent[i+1][0] for i in range(len(recent)-1))
+    if not shrink:
+        return None
+    vol_ok = all(recent[i][1] >= recent[i+1][1] for i in range(len(recent)-1))
+    strength = "強" if (vol_ok and len(recent) >= 3) else "中"
+    return f"VCP {len(recent)}次收縮（{strength}）"
+
+def _detect_double_bottom(c):
+    n = len(c)
+    if n < 40:
+        return None
+    w = 7
+    raw_lows = [i for i in range(w, n - w) if c[i] <= min(c[i-w:i+w+1]) + 1e-9]
+    merged = []
+    for li in raw_lows:
+        if not merged or li - merged[-1] > w * 2:
+            merged.append(li)
+    if len(merged) < 2:
+        return None
+    for i in range(len(merged) - 1):
+        l1, l2 = merged[i], merged[i+1]
+        if l2 - l1 < 15:
+            continue
+        p1, p2 = c[l1], c[l2]
+        if abs(p1 - p2) / min(p1, p2) > 0.05:
+            continue
+        neck = max(c[l1:l2+1])
+        if neck < min(p1, p2) * 1.05:
+            continue
+        dist = (neck - c[-1]) / neck * 100
+        if -10 <= dist <= 5:
+            return f"雙底，頸線 {neck:.1f}（距 {dist:.1f}%）"
+    return None
+
+def _detect_flat_base(c, v):
+    n = len(c)
+    for period in [25, 35, 50]:
+        if n < period + 20:
+            continue
+        seg, sv = c[-period:], v[-period:]
+        h, lo = max(seg), min(seg)
+        rng = (h - lo) / h * 100
+        if rng > 12:
+            continue
+        if h < max(c[-min(120, n):]) * 0.75:
+            continue
+        mid = period // 2
+        vol_ratio = np.mean(sv[mid:]) / (np.mean(sv[:mid]) + 1e-9)
+        note = "量縮" if vol_ratio < 0.85 else ""
+        return f"平台底 {period}日，波動 {rng:.1f}%{(' '+note) if note else ''}"
+    return None
+
+def _detect_cup_handle(c, v):
+    n = len(c)
+    if n < 60:
+        return None
+    lb = min(120, n)
+    seg = c[-lb:]
+    t1, t2 = lb // 3, 2 * lb // 3
+    lh = max(seg[:t1])
+    lhi = int(np.argmax(seg[:t1]))
+    cup_lo = min(seg[lhi:t2])
+    cup_li = lhi + int(np.argmin(seg[lhi:t2]))
+    depth = (lh - cup_lo) / lh * 100
+    if depth < 10 or depth > 40:
+        return None
+    r_seg = seg[cup_li:t2+1]
+    if len(r_seg) < 5:
+        return None
+    rh = max(r_seg)
+    rhi = cup_li + int(np.argmax(r_seg))
+    if abs(rh - lh) / lh > 0.08:
+        return None
+    handle = seg[rhi:]
+    if len(handle) < 5:
+        return None
+    hlo = min(handle)
+    hdepth = (rh - hlo) / rh * 100
+    if hdepth < 3 or hdepth > 20:
+        return None
+    if hlo < cup_lo + (lh - cup_lo) * 0.5:
+        return None
+    dist = (rh - seg[-1]) / rh * 100
+    return f"杯柄，杯深 {depth:.1f}%，突破點 {rh:.1f}（距 {dist:.1f}%）"
+
+def _detect_divergence(df, lookback=25):
+    hits = []
+    if len(df) < lookback + 5:
+        return hits
+    window = df.tail(lookback)
+    half   = lookback // 2
+    first  = window.iloc[:half]
+    second = window.iloc[half:]
+    tol_pct = 0.015
+    if "OBV" in df.columns:
+        ph1, ph2 = first["Close"].max(),  second["Close"].max()
+        oh1, oh2 = first["OBV"].max(),    second["OBV"].max()
+        pl1, pl2 = first["Close"].min(),  second["Close"].min()
+        ol1, ol2 = first["OBV"].min(),    second["OBV"].min()
+        if all(pd.notna(x) for x in (ph1, ph2, oh1, oh2)):
+            if ph2 > ph1 * (1 + tol_pct) and oh2 < oh1:
+                hits.append("OBV頂背離")
+        if all(pd.notna(x) for x in (pl1, pl2, ol1, ol2)):
+            if pl2 < pl1 * (1 - tol_pct) and ol2 > ol1:
+                hits.append("OBV底背離")
+    if "RSI14" in df.columns:
+        ph1, ph2 = first["Close"].max(),   second["Close"].max()
+        rh1, rh2 = first["RSI14"].max(),   second["RSI14"].max()
+        pl1, pl2 = first["Close"].min(),   second["Close"].min()
+        rl1, rl2 = first["RSI14"].min(),   second["RSI14"].min()
+        if all(pd.notna(x) for x in (ph1, ph2, rh1, rh2)):
+            if ph2 > ph1 * (1 + tol_pct) and rh2 < rh1 - 3:
+                hits.append("RSI頂背離")
+        if all(pd.notna(x) for x in (pl1, pl2, rl1, rl2)):
+            if pl2 < pl1 * (1 - tol_pct) and rl2 > rl1 + 3:
+                hits.append("RSI底背離")
+    return hits
+
+def detect_all_patterns(df):
+    c = df["Close"].values.astype(float)
+    v = df["Volume"].values.astype(float)
+    hits = []
+    for fn in (_detect_vcp, _detect_flat_base):
+        r = fn(c, v)
+        if r:
+            hits.append(r)
+    r = _detect_double_bottom(c)
+    if r:
+        hits.append(r)
+    r = _detect_cup_handle(c, v)
+    if r:
+        hits.append(r)
+    hits.extend(_detect_divergence(df))
+    return hits
+
+# ── 相對強度 vs 0050 ────────────────────────────────────────────────────────
+def _fetch_benchmark():
+    try:
+        df = yf.download("0050.TW", period=PERIOD, auto_adjust=True, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.index = pd.to_datetime(df.index)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+def _calc_rs(df, bench_df, n=63):
+    try:
+        if bench_df is None or len(df) <= n or len(bench_df) <= n:
+            return None
+        s_ret = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-1-n]) - 1) * 100
+        b_ret = (float(bench_df["Close"].iloc[-1]) / float(bench_df["Close"].iloc[-1-n]) - 1) * 100
+        return round(s_ret - b_ret, 1)
+    except Exception:
+        return None
+
+# ── 評分 ──────────────────────────────────────────────────────────────────────
+def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
+    latest = df.iloc[-1]
+    close  = float(latest["Close"])
+    if float(latest[fast_col]) <= float(latest[slow_col]):
+        return 0
+    top_divs = [p for p in patterns if "頂背離" in p]
+    rsi_now  = float(latest["RSI14"]) if "RSI14" in df.columns and pd.notna(latest.get("RSI14")) else 50
+    r1m      = float(df["R1M"].iloc[-1]) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else 0
+    score = 0
+    sig_df = df[df["signal"] == 1]
+    if not sig_df.empty:
+        days_since = (df.index[-1] - sig_df.iloc[-1].name).days
+        if days_since <= 2:   score += 35
+        elif days_since <= 5: score += 28
+        elif days_since <= 10: score += 18
+        elif days_since <= 20: score += 10
+        elif days_since <= 45: score += 4
+    vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+    if pd.notna(vol_avg) and float(vol_avg) > 0:
+        vol_ratio = float(latest["Volume"]) / float(vol_avg)
+        if vol_ratio >= 2.0:   score += 20
+        elif vol_ratio >= 1.5: score += 14
+        elif vol_ratio >= 1.0: score += 7
+        elif vol_ratio >= 0.7: score += 2
+    pos_pats = [p for p in patterns if "頂背離" not in p]
+    PAT_W = {"VCP": 12, "杯柄": 10, "雙底": 9, "平台底": 7, "OBV底背離": 8, "RSI底背離": 5}
+    score += min(20, sum(w for k, w in PAT_W.items() if any(k in p for p in pos_pats)))
+    score -= len(top_divs) * 20
+    if 52 <= rsi_now <= 65:   score += 10
+    elif (45 <= rsi_now < 52) or (65 < rsi_now <= 72): score += 5
+    elif rsi_now > 75:        score -= 10
+    if 3 < r1m <= 15:         score += 10
+    elif 0 < r1m <= 3 or 15 < r1m <= 25: score += 5
+    elif r1m > 30:            score -= 8
+    if rs_val is not None:
+        if rs_val >= 15:      score += 10
+        elif rs_val >= 5:     score += 6
+        elif rs_val >= 0:     score += 2
+        elif rs_val <= -15:   score -= 12
+        elif rs_val <= -5:    score -= 6
+    high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
+    if float(high_52) > 0:
+        dist_pct = (close / float(high_52) - 1) * 100
+        if -8 <= dist_pct <= 0:     score += 5
+        elif -20 <= dist_pct < -8:  score += 3
+        elif dist_pct < -40:        score -= 3
+    cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
+    return max(0, min(cap, score))
+
+# ── 單支股票分析 ───────────────────────────────────────────────────────────────
+def _analyze_one(code, stock_df, bench_df=None, sector="—"):
+    stock_df = stock_df.copy()
+    stock_df.index = pd.to_datetime(stock_df.index)
+    stock_df = stock_df.dropna(subset=["Close"])
+    if len(stock_df) < max(SLOW_MA + 10, 40):
+        return None
+    df, fast_col, slow_col = calc_indicators(stock_df, FAST_MA, SLOW_MA)
+    avg_vol = df["Volume"].tail(20).mean() if "Volume" in df.columns else 0
+    latest_close = float(df["Close"].iloc[-1]) if not df.empty else 0
+    if avg_vol < 500 or (avg_vol * latest_close) < 5_000_000:
+        return None
+    latest  = df.iloc[-1]
+    close   = float(latest["Close"])
+    gap_now = float(latest[fast_col]) - float(latest[slow_col])
+    trend   = "多頭" if gap_now > 0 else "空頭"
+    sig_df  = df[df["signal"] != 0]
+    if sig_df.empty:
+        last_sig, last_date, days_ago = "無", "—", 999
+    else:
+        last_row  = sig_df.iloc[-1]
+        last_sig  = "入場" if last_row["signal"] == 1 else "出場"
+        last_date = last_row.name.strftime("%Y-%m-%d")
+        days_ago  = (df.index[-1] - last_row.name).days
+    if last_sig == "入場" and days_ago <= 5:
+        tag = "近期黃金交叉"
+    elif trend == "多頭" and last_sig == "入場":
+        tag = "多頭持續中"
+    elif last_sig == "出場" and days_ago <= 5:
+        tag = "近期死亡交叉"
+    elif trend == "空頭":
+        tag = "空頭排列"
+    else:
+        tag = "觀察中"
+    patterns   = detect_all_patterns(df)
+    top_divs   = [p for p in patterns if "頂背離" in p]
+    consol_pat = [p for p in patterns if any(k in p for k in ["VCP", "平台底", "杯柄", "雙底"])]
+    _r1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-21]) - 1) * 100 if len(df) > 21 else 0
+    _r3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-63]) - 1) * 100 if len(df) > 63 else 0
+    is_extended = (_r1m > 25 and not consol_pat) or (_r3m > 60 and not consol_pat)
+    if top_divs:
+        action = "不看"
+    elif is_extended:
+        action = "不看"
+    elif trend == "多頭" and tag == "近期黃金交叉":
+        action = "可買"
+    elif trend == "多頭" and (tag == "多頭持續中" or consol_pat):
+        action = "等待進場"
+    elif trend == "多頭" and tag == "觀察中" and consol_pat:
+        action = "等待進場"
+    else:
+        action = "不看"
+    rs_val  = _calc_rs(df, bench_df)
+    if action == "可買":
+        if rs_val is not None and rs_val < -15:
+            action = "等待進場"
+    score   = calc_score(df, patterns, fast_col, slow_col, rs_val)
+    high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
+    dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
+    rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
+    r1m_val  = round(float(df["R1M"].iloc[-1]), 1) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else None
+    return {
+        "分數": score,
+        "代號": code,
+        "產業": sector,
+        "操作": action,
+        "收盤價": round(close, 2),
+        "RSI": rsi_now if rsi_now is not None else "—",
+        "1M%": f"{r1m_val:+.1f}%" if r1m_val is not None else "—",
+        "距52高%": f"{dist_52h:+.1f}%" if dist_52h is not None else "—",
+        "RS大盤": f"{rs_val:+.1f}%" if rs_val is not None else "—",
+        "狀態": tag,
+        "訊號日": last_date,
+        "幾天前": days_ago if days_ago < 999 else "—",
+        "型態": "、".join(patterns) if patterns else "—",
+    }
+
+# ── 批次下載 + 掃描 ────────────────────────────────────────────────────────────
+def _fetch_multi(symbols_tuple):
+    syms = list(symbols_tuple)
+    def _dl():
+        return yf.download(syms, period=PERIOD, auto_adjust=True,
+                           progress=False, group_by="ticker", threads=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        try:
+            return ex.submit(_dl).result(timeout=60)
+        except concurrent.futures.TimeoutError:
+            return pd.DataFrame()
+
+def _extract_one(multi_df, symbol, n_syms):
+    if not isinstance(multi_df.columns, pd.MultiIndex):
+        return multi_df
+    try:
+        lvl0 = multi_df.columns.get_level_values(0)
+        if symbol in lvl0:
+            s = multi_df[symbol].dropna(how="all")
+            return s if not s.empty else None
+        return None
+    except Exception:
+        return None
+
+def scan_stocks(codes, bench_df, sector_map):
+    results = []
+    total = len(codes)
+    for i in range(0, total, 100):
+        batch_codes = codes[i: i + 100]
+        batch_syms  = [f"{c}{SUFFIX}" for c in batch_codes]
+        print(f"\r  {i+1}–{min(i+100, total)} / {total}", end="", flush=True)
+        try:
+            multi = _fetch_multi(tuple(batch_syms))
+        except Exception:
+            continue
+        for code, sym in zip(batch_codes, batch_syms):
+            try:
+                sdf = _extract_one(multi, sym, len(batch_syms))
+                if sdf is None:
+                    continue
+                row = _analyze_one(code, sdf, bench_df=bench_df,
+                                   sector=sector_map.get(code, "—"))
+                if row:
+                    results.append(row)
+            except Exception:
+                continue
+    print()
+    return pd.DataFrame(results)
+
+# ── 寄信 ─────────────────────────────────────────────────────────────────────
+def send_email(df, total_scanned):
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    n     = len(df)
+
+    if df.empty:
+        body_html = f"<p>今日無分數 ≥ {MIN_SCORE} 且操作建議為「可買」或「等待進場」的股票。</p>"
+    else:
+        cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
+                "距52高%", "RS大盤", "連買天", "外資累計(張)", "幾天前", "型態"]
+        cols = [c for c in cols if c in df.columns]
+        # 操作欄用顏色標記
+        def _row_color(op):
+            return "#d4edda" if op == "可買" else "#fff3cd" if op == "等待進場" else "white"
+        rows_html = ""
+        for _, r in df.iterrows():
+            bg = _row_color(r.get("操作", ""))
+            cells = "".join(f"<td style='padding:5px 8px;border-bottom:1px solid #ddd'>{r.get(c,'')}</td>" for c in cols)
+            rows_html += f"<tr style='background:{bg}'>{cells}</tr>"
+        headers = "".join(f"<th style='padding:6px 8px;text-align:left;background:#2c3e50;color:white'>{c}</th>" for c in cols)
+        body_html = f"""
+<table style='border-collapse:collapse;width:100%;font-size:13px'>
+<thead><tr>{headers}</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>"""
+
+    html = f"""<html><body style='font-family:Arial,sans-serif;padding:20px'>
+<h2 style='color:#2c3e50'>台股每日掃描 — {today}</h2>
+<p>掃描 {total_scanned} 支上市股票，共 <b>{n}</b> 支符合條件（分數 ≥ {MIN_SCORE}），依連買天數排序：</p>
+{body_html}
+<p style='color:#999;font-size:11px;margin-top:20px'>
+  均線 MA{FAST_MA}/MA{SLOW_MA} · 止損 {STOP_PCT}% · 期間 {PERIOD} · 綠=可買 黃=等待進場
+</p>
+</body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"【台股掃描】{datetime.now().strftime('%m/%d')} — {n} 支值得關注"
+    msg["From"]    = GMAIL_USER
+    msg["To"]      = TO_EMAIL
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PW)
+        s.sendmail(GMAIL_USER, TO_EMAIL, msg.as_string())
+
+# ── 主程式 ────────────────────────────────────────────────────────────────────
+def main():
+    print(f"[{datetime.now():%H:%M:%S}] 台股每日掃描啟動")
+
+    if not GMAIL_APP_PW:
+        print("錯誤：請設定環境變數 GMAIL_APP_PW（Gmail App Password）")
+        sys.exit(1)
+
+    print("抓取 T86 法人資料...")
+    inst_data = _fetch_institutional_data()
+    print(f"  外資有買超：{len(inst_data)} 支")
+
+    print("抓取股票代號...")
+    codes = fetch_twse_codes()
+    print(f"  上市股票：{len(codes)} 支")
+
+    print("抓取產業/基準資料...")
+    sector_map = fetch_sector_map()
+    bench_df   = _fetch_benchmark()
+
+    print("開始掃描（每批 100 支）：")
+    result_df = scan_stocks(codes, bench_df, sector_map)
+    print(f"  有效股票：{len(result_df)} 支")
+
+    if not result_df.empty and inst_data:
+        result_df["連買天"]     = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("consec", 0))
+        result_df["外資累計(張)"] = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("total", 0) // 1000)
+    else:
+        result_df["連買天"]     = 0
+        result_df["外資累計(張)"] = 0
+
+    filtered = result_df[
+        (result_df["分數"] >= MIN_SCORE) &
+        (result_df["操作"].isin(["可買", "等待進場"]))
+    ].copy()
+    filtered = filtered.sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N)
+
+    print(f"  符合條件（分數≥{MIN_SCORE}）：{len(filtered)} 支")
+    print("寄送郵件...")
+    send_email(filtered, len(codes))
+    print(f"[{datetime.now():%H:%M:%S}] 完成")
+
+if __name__ == "__main__":
+    main()

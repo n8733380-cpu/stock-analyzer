@@ -1,0 +1,30 @@
+name: 台股每日掃描
+
+on:
+  schedule:
+    - cron: '30 9 * * 1-5'  # 09:30 UTC = 17:30 台灣時間（T86 發布後）
+  workflow_dispatch:         # 允許手動觸發
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy requests twstock
+
+      - name: Run daily scan
+        env:
+          GMAIL_APP_PW: ${{ secrets.GMAIL_APP_PW }}
+        run: python daily_scan.py
