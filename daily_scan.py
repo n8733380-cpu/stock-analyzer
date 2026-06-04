@@ -20,11 +20,11 @@ GMAIL_USER   = "n8733380@gmail.com"
 GMAIL_APP_PW = os.environ.get("GMAIL_APP_PW", "")  # 從環境變數讀取
 TO_EMAIL     = "n8733380@gmail.com"
 
-FAST_MA   = 20
-SLOW_MA   = 60
+FAST_MA   = 5
+SLOW_MA   = 20
 STOP_PCT  = 8
 PERIOD    = "1y"
-MIN_SCORE = 62
+MIN_SCORE = 55
 TOP_N     = 15
 SCAN_OTC  = True   # 同時掃上櫃（.TWO）
 
@@ -138,6 +138,37 @@ def fetch_otc_codes():
         return codes
     except Exception:
         return []
+
+def fetch_monthly_revenue():
+    """抓取最新月營收 YoY 成長率，回傳 {code: yoy_pct}"""
+    today = datetime.today()
+    if today.day >= 12:
+        ref = today.replace(day=1) - timedelta(days=1)
+    else:
+        ref = today.replace(day=1) - timedelta(days=32)
+    roc_year = ref.year - 1911
+    month    = ref.month
+    result   = {}
+    for market in ["sii", "otc"]:
+        try:
+            url  = (f"https://mops.twse.com.tw/nas/t21/{market}/"
+                    f"t21sc03_{roc_year}_{month:02d}_0.html")
+            r    = requests.get(url, timeout=25, verify=False,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            html = r.content.decode("cp950", errors="ignore")
+            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+            for row in rows:
+                cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+                cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+                if len(cells) >= 7 and len(cells[0]) == 4 and cells[0].isdigit():
+                    try:
+                        result[cells[0]] = float(cells[6].replace(",", ""))
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  月營收抓取失敗（{market}）：{e}")
+    print(f"  月營收資料：{len(result)} 支")
+    return result
 
 def fetch_sector_map():
     try:
@@ -363,7 +394,7 @@ def _calc_rs(df, bench_df, n=63):
         return None
 
 # ── 評分 ──────────────────────────────────────────────────────────────────────
-def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
+def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
     latest = df.iloc[-1]
     close  = float(latest["Close"])
     if float(latest[fast_col]) <= float(latest[slow_col]):
@@ -409,11 +440,21 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
         if -8 <= dist_pct <= 0:     score += 5
         elif -20 <= dist_pct < -8:  score += 3
         elif dist_pct < -40:        score -= 3
+    # MA20 > MA60 長期多頭加分
+    if "MA60" in df.columns and pd.notna(df["MA60"].iloc[-1]):
+        if pd.notna(df[slow_col].iloc[-1]) and float(df[slow_col].iloc[-1]) > float(df["MA60"].iloc[-1]):
+            score += 5
+    # 月營收 YoY 加分
+    if revenue_yoy is not None:
+        if revenue_yoy >= 30:    score += 15
+        elif revenue_yoy >= 15:  score += 8
+        elif revenue_yoy >= 5:   score += 3
+        elif revenue_yoy <= -20: score -= 8
     cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
     return max(0, min(cap, score))
 
 # ── 單支股票分析 ───────────────────────────────────────────────────────────────
-def _analyze_one(code, stock_df, bench_df=None, sector="—"):
+def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     stock_df = stock_df.copy()
     stock_df.index = pd.to_datetime(stock_df.index)
     stock_df = stock_df.dropna(subset=["Close"])
@@ -472,7 +513,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—"):
     # RSI 超買 + 大漲，沒有合理進場時機點
     elif rsi_cur > 73 and _r1m > 18 and action == "等待進場":
         action = "不看"
-    score   = calc_score(df, patterns, fast_col, slow_col, rs_val)
+    score   = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
     high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
     rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
@@ -491,6 +532,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—"):
         "訊號日": last_date,
         "幾天前": days_ago if days_ago < 999 else "—",
         "型態": "、".join(patterns) if patterns else "—",
+        "月營收YoY": f"{revenue_yoy:+.0f}%" if revenue_yoy is not None else "—",
     }
 
 # ── MOPS 重大公告監控 ─────────────────────────────────────────────────────────
@@ -560,7 +602,7 @@ def _extract_one(multi_df, symbol, n_syms):
     except Exception:
         return None
 
-def scan_stocks(codes, bench_df, sector_map, suffix=".TW"):
+def scan_stocks(codes, bench_df, sector_map, suffix=".TW", revenue_dict=None):
     results = []
     total = len(codes)
     for i in range(0, total, 100):
@@ -577,7 +619,8 @@ def scan_stocks(codes, bench_df, sector_map, suffix=".TW"):
                 if sdf is None:
                     continue
                 row = _analyze_one(code, sdf, bench_df=bench_df,
-                                   sector=sector_map.get(code, "—"))
+                                   sector=sector_map.get(code, "—"),
+                                   revenue_yoy=(revenue_dict or {}).get(code))
                 if row:
                     results.append(row)
             except Exception:
@@ -595,7 +638,7 @@ def send_email(df, total_scanned, mops_news=None):
         body_html = f"<p>今日無分數 ≥ {MIN_SCORE} 且操作建議為「可買」或「等待進場」的股票。</p>"
     else:
         cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
-                "距52高%", "RS大盤", "連買天", "外資累計(張)", "幾天前", "型態"]
+                "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "型態"]
         cols = [c for c in cols if c in df.columns]
         # 操作欄用顏色標記
         def _row_color(op):
@@ -675,18 +718,21 @@ def main():
     codes_two = fetch_otc_codes() if SCAN_OTC else []
     print(f"  上市：{len(codes_tw)} 支 ／ 上櫃：{len(codes_two)} 支")
 
-    print("抓取產業/基準資料...")
-    sector_map = fetch_sector_map()
-    bench_df   = _fetch_benchmark()
+    print("抓取產業/基準/月營收資料...")
+    sector_map   = fetch_sector_map()
+    bench_df     = _fetch_benchmark()
+    revenue_dict = fetch_monthly_revenue()
 
     print("開始掃描上市（每批 100 支）：")
-    result_tw = scan_stocks(codes_tw, bench_df, sector_map, suffix=".TW")
+    result_tw = scan_stocks(codes_tw, bench_df, sector_map, suffix=".TW",
+                            revenue_dict=revenue_dict)
     print(f"  上市有效：{len(result_tw)} 支")
 
     result_two = pd.DataFrame()
     if SCAN_OTC and codes_two:
         print("開始掃描上櫃（每批 100 支）：")
-        result_two = scan_stocks(codes_two, bench_df, sector_map, suffix=".TWO")
+        result_two = scan_stocks(codes_two, bench_df, sector_map, suffix=".TWO",
+                                 revenue_dict=revenue_dict)
         print(f"  上櫃有效：{len(result_two)} 支")
 
     result_df = pd.concat([result_tw, result_two], ignore_index=True) if not result_two.empty else result_tw
