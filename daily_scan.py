@@ -140,28 +140,63 @@ def fetch_otc_codes():
         return []
 
 def fetch_monthly_revenue():
-    """抓取最新月營收 YoY 成長率（上市），回傳 {code: yoy_pct}
-    資料來源：TWSE OpenAPI t187ap05_L，自動回傳最新一個月
-    欄位 index 2 = 公司代號，index 9 = 當月比去年同期增減(%)
+    """抓取最新月營收 YoY 成長率，回傳 {code: yoy_pct}
+    上市：TWSE OpenAPI（穩定）
+    上櫃：MOPS AJAX（本機可能被擋，GitHub Actions 通常可通）
     """
     result = {}
+
+    # ── 上市：TWSE OpenAPI ────────────────────────────────────────────
     try:
-        url = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
-        r   = requests.get(url, timeout=25, verify=False,
-                           headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+                         timeout=25, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
-            data = r.json()
-            for row in data:
+            for row in r.json():
                 vals = list(row.values())
                 if len(vals) >= 10:
-                    code = str(vals[2]).strip()
                     try:
-                        result[code] = float(vals[9])
+                        result[str(vals[2]).strip()] = float(vals[9])
                     except Exception:
                         pass
     except Exception as e:
-        print(f"  月營收抓取失敗：{e}")
-    print(f"  月營收資料：{len(result)} 支（上市）")
+        print(f"  月營收上市抓取失敗：{e}")
+
+    # ── 上櫃：MOPS AJAX（需最新一個月參數）──────────────────────────
+    try:
+        today = datetime.today()
+        ref   = (today.replace(day=1) - timedelta(days=1)) if today.day >= 12 \
+                else (today.replace(day=1) - timedelta(days=32))
+        roc_year, month = ref.year - 1911, ref.month
+        url  = "https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs"
+        hdrs = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer":    "https://mops.twse.com.tw/mops/web/t05st10",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        payload = {
+            "encodeURIComponent": "1", "step": "1", "firstin": "1",
+            "off": "1", "TYPEK": "otc", "isnew": "false",
+            "year": str(roc_year), "month": f"{month:02d}",
+        }
+        r2   = requests.post(url, data=payload, headers=hdrs,
+                             timeout=25, verify=False)
+        html = r2.content.decode("utf-8", errors="ignore")
+        import re as _re
+        rows = _re.findall(r'<tr[^>]*>(.*?)</tr>', html, _re.DOTALL)
+        for row in rows:
+            cells = _re.findall(r'<td[^>]*>(.*?)</td>', row, _re.DOTALL)
+            cells = [_re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            if len(cells) >= 10 and len(cells[0]) == 4 and cells[0].isdigit():
+                try:
+                    result[cells[0]] = float(cells[9].replace(",", ""))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"  月營收上櫃抓取失敗：{e}")
+
+    listed = sum(1 for c in result if not c.startswith("9"))
+    print(f"  月營收資料：{len(result)} 支（上市約 {listed}）")
     return result
 
 def fetch_sector_map():
