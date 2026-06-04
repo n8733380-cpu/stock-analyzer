@@ -140,34 +140,28 @@ def fetch_otc_codes():
         return []
 
 def fetch_monthly_revenue():
-    """抓取最新月營收 YoY 成長率，回傳 {code: yoy_pct}"""
-    today = datetime.today()
-    if today.day >= 12:
-        ref = today.replace(day=1) - timedelta(days=1)
-    else:
-        ref = today.replace(day=1) - timedelta(days=32)
-    roc_year = ref.year - 1911
-    month    = ref.month
-    result   = {}
-    for market in ["sii", "otc"]:
-        try:
-            url  = (f"https://mops.twse.com.tw/nas/t21/{market}/"
-                    f"t21sc03_{roc_year}_{month:02d}_0.html")
-            r    = requests.get(url, timeout=25, verify=False,
-                                headers={"User-Agent": "Mozilla/5.0"})
-            html = r.content.decode("cp950", errors="ignore")
-            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
-            for row in rows:
-                cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-                cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-                if len(cells) >= 7 and len(cells[0]) == 4 and cells[0].isdigit():
+    """抓取最新月營收 YoY 成長率（上市），回傳 {code: yoy_pct}
+    資料來源：TWSE OpenAPI t187ap05_L，自動回傳最新一個月
+    欄位 index 2 = 公司代號，index 9 = 當月比去年同期增減(%)
+    """
+    result = {}
+    try:
+        url = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+        r   = requests.get(url, timeout=25, verify=False,
+                           headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            data = r.json()
+            for row in data:
+                vals = list(row.values())
+                if len(vals) >= 10:
+                    code = str(vals[2]).strip()
                     try:
-                        result[cells[0]] = float(cells[6].replace(",", ""))
+                        result[code] = float(vals[9])
                     except Exception:
                         pass
-        except Exception as e:
-            print(f"  月營收抓取失敗（{market}）：{e}")
-    print(f"  月營收資料：{len(result)} 支")
+    except Exception as e:
+        print(f"  月營收抓取失敗：{e}")
+    print(f"  月營收資料：{len(result)} 支（上市）")
     return result
 
 def fetch_sector_map():
