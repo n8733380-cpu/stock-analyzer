@@ -20,13 +20,19 @@ GMAIL_USER   = "n8733380@gmail.com"
 GMAIL_APP_PW = os.environ.get("GMAIL_APP_PW", "")  # 從環境變數讀取
 TO_EMAIL     = "n8733380@gmail.com"
 
-FAST_MA  = 20
-SLOW_MA  = 60
-STOP_PCT = 8
-PERIOD   = "1y"
-SUFFIX   = ".TW"
-MIN_SCORE = 50
+FAST_MA   = 20
+SLOW_MA   = 60
+STOP_PCT  = 8
+PERIOD    = "1y"
+MIN_SCORE = 62
 TOP_N     = 15
+SCAN_OTC  = True   # 同時掃上櫃（.TWO）
+
+# MOPS 重大公告監控關鍵字
+MOPS_KEYWORDS = [
+    "資產處分", "出售土地", "出售廠房", "出售不動產",
+    "重大合約", "簽訂合作", "策略合作", "取得重大資產",
+]
 
 # ── 進度列替代（print）────────────────────────────────────────────────────────
 class _Progress:
@@ -114,13 +120,32 @@ def fetch_twse_codes():
     except Exception:
         return []
 
+def fetch_otc_codes():
+    """抓取上櫃股票代號"""
+    try:
+        import twstock
+        codes = [
+            code for code, info in twstock.codes.items()
+            if getattr(info, "market", "") == "上櫃"
+            and len(code) == 4 and code[0] != "0"
+        ]
+        if codes:
+            return sorted(set(codes))
+    except Exception:
+        pass
+    try:
+        codes, _ = _parse_isin_page(4)
+        return codes
+    except Exception:
+        return []
+
 def fetch_sector_map():
     try:
         import twstock
         smap = {
             code: getattr(info, "group", "—")
             for code, info in twstock.codes.items()
-            if getattr(info, "market", "") == "上市" and getattr(info, "group", "")
+            if getattr(info, "market", "") in ("上市", "上櫃") and getattr(info, "group", "")
         }
         if smap:
             return smap
@@ -440,9 +465,13 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—"):
     else:
         action = "不看"
     rs_val  = _calc_rs(df, bench_df)
-    if action == "可買":
-        if rs_val is not None and rs_val < -15:
-            action = "等待進場"
+    rsi_cur = float(df["RSI14"].iloc[-1]) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else 50
+    # 跑輸大盤 15% 以上：無論操作類型一律不看
+    if rs_val is not None and rs_val < -15:
+        action = "不看"
+    # RSI 超買 + 大漲，沒有合理進場時機點
+    elif rsi_cur > 73 and _r1m > 18 and action == "等待進場":
+        action = "不看"
     score   = calc_score(df, patterns, fast_col, slow_col, rs_val)
     high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
@@ -463,6 +492,49 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—"):
         "幾天前": days_ago if days_ago < 999 else "—",
         "型態": "、".join(patterns) if patterns else "—",
     }
+
+# ── MOPS 重大公告監控 ─────────────────────────────────────────────────────────
+def fetch_mops_news():
+    """抓取 MOPS 今日重大訊息，過濾出催化劑型公告"""
+    date_str = datetime.today().strftime("%Y%m%d")
+    url = "https://mops.twse.com.tw/mops/web/ajax_t05sr01_1"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://mops.twse.com.tw/mops/web/t05sr01_1",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    payload = {
+        "encodeURIComponent": "1", "step": "1", "firstin": "1",
+        "off": "1", "keyword4": "", "code1": "", "TYPEK2": "",
+        "checkbtn": "", "queryName": "co_id", "inpuData": "",
+        "co_id": "", "begin_date": date_str, "end_date": date_str,
+    }
+    results = []
+    try:
+        r = requests.post(url, data=payload, headers=headers, timeout=25)
+        html = r.content.decode("utf-8", errors="ignore")
+        # 擷取每列 td 內容
+        raw_rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+        for row in raw_rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            if len(cells) < 5:
+                continue
+            code = cells[0]
+            if not (len(code) == 4 and code.isdigit()):
+                continue
+            subject = cells[4] if len(cells) > 4 else ""
+            if not any(kw in subject for kw in MOPS_KEYWORDS):
+                continue
+            results.append({
+                "代號": code,
+                "公司": cells[1] if len(cells) > 1 else "",
+                "時間": cells[3] if len(cells) > 3 else "",
+                "主旨": subject,
+            })
+    except Exception as e:
+        print(f"  MOPS 抓取失敗：{e}")
+    return results
 
 # ── 批次下載 + 掃描 ────────────────────────────────────────────────────────────
 def _fetch_multi(symbols_tuple):
@@ -488,12 +560,12 @@ def _extract_one(multi_df, symbol, n_syms):
     except Exception:
         return None
 
-def scan_stocks(codes, bench_df, sector_map):
+def scan_stocks(codes, bench_df, sector_map, suffix=".TW"):
     results = []
     total = len(codes)
     for i in range(0, total, 100):
         batch_codes = codes[i: i + 100]
-        batch_syms  = [f"{c}{SUFFIX}" for c in batch_codes]
+        batch_syms  = [f"{c}{suffix}" for c in batch_codes]
         print(f"\r  {i+1}–{min(i+100, total)} / {total}", end="", flush=True)
         try:
             multi = _fetch_multi(tuple(batch_syms))
@@ -514,7 +586,7 @@ def scan_stocks(codes, bench_df, sector_map):
     return pd.DataFrame(results)
 
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
-def send_email(df, total_scanned):
+def send_email(df, total_scanned, mops_news=None):
     _days = ["一", "二", "三", "四", "五", "六", "日"]
     today = datetime.now().strftime("%Y-%m-%d") + f"（週{_days[datetime.now().weekday()]}）"
     n     = len(df)
@@ -540,10 +612,37 @@ def send_email(df, total_scanned):
 <tbody>{rows_html}</tbody>
 </table>"""
 
+    # MOPS 重大公告區段
+    mops_html = ""
+    if mops_news:
+        mops_rows = ""
+        for m in mops_news:
+            mops_rows += (
+                f"<tr>"
+                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['代號']}</td>"
+                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['公司']}</td>"
+                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['時間']}</td>"
+                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['主旨']}</td>"
+                f"</tr>"
+            )
+        mops_html = f"""
+<h3 style='color:#c0392b;margin-top:30px'>今日重大公告（{len(mops_news)} 筆）</h3>
+<p style='color:#666;font-size:12px'>來源：MOPS 公開資訊觀測站｜含關鍵字：資產處分、重大合約、取得重大資產</p>
+<table style='border-collapse:collapse;width:100%;font-size:13px'>
+<thead><tr>
+  <th style='padding:5px 8px;background:#c0392b;color:white'>代號</th>
+  <th style='padding:5px 8px;background:#c0392b;color:white'>公司</th>
+  <th style='padding:5px 8px;background:#c0392b;color:white'>時間</th>
+  <th style='padding:5px 8px;background:#c0392b;color:white'>主旨</th>
+</tr></thead>
+<tbody>{mops_rows}</tbody>
+</table>"""
+
     html = f"""<html><body style='font-family:Arial,sans-serif;padding:20px'>
 <h2 style='color:#2c3e50'>台股每日掃描 — {today}</h2>
-<p>掃描 {total_scanned} 支上市股票，共 <b>{n}</b> 支符合條件（分數 ≥ {MIN_SCORE}），依連買天數排序：</p>
+<p>掃描 {total_scanned} 支上市＋上櫃股票，共 <b>{n}</b> 支符合條件（分數 ≥ {MIN_SCORE}），依連買天數排序：</p>
 {body_html}
+{mops_html}
 <p style='color:#999;font-size:11px;margin-top:20px'>
   均線 MA{FAST_MA}/MA{SLOW_MA} · 止損 {STOP_PCT}% · 期間 {PERIOD} · 綠=可買 黃=等待進場
 </p>
@@ -572,22 +671,31 @@ def main():
     print(f"  外資有買超：{len(inst_data)} 支")
 
     print("抓取股票代號...")
-    codes = fetch_twse_codes()
-    print(f"  上市股票：{len(codes)} 支")
+    codes_tw  = fetch_twse_codes()
+    codes_two = fetch_otc_codes() if SCAN_OTC else []
+    print(f"  上市：{len(codes_tw)} 支 ／ 上櫃：{len(codes_two)} 支")
 
     print("抓取產業/基準資料...")
     sector_map = fetch_sector_map()
     bench_df   = _fetch_benchmark()
 
-    print("開始掃描（每批 100 支）：")
-    result_df = scan_stocks(codes, bench_df, sector_map)
-    print(f"  有效股票：{len(result_df)} 支")
+    print("開始掃描上市（每批 100 支）：")
+    result_tw = scan_stocks(codes_tw, bench_df, sector_map, suffix=".TW")
+    print(f"  上市有效：{len(result_tw)} 支")
+
+    result_two = pd.DataFrame()
+    if SCAN_OTC and codes_two:
+        print("開始掃描上櫃（每批 100 支）：")
+        result_two = scan_stocks(codes_two, bench_df, sector_map, suffix=".TWO")
+        print(f"  上櫃有效：{len(result_two)} 支")
+
+    result_df = pd.concat([result_tw, result_two], ignore_index=True) if not result_two.empty else result_tw
 
     if not result_df.empty and inst_data:
-        result_df["連買天"]     = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("consec", 0))
+        result_df["連買天"]       = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("consec", 0))
         result_df["外資累計(張)"] = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("total", 0) // 1000)
     else:
-        result_df["連買天"]     = 0
+        result_df["連買天"]       = 0
         result_df["外資累計(張)"] = 0
 
     filtered = result_df[
@@ -595,10 +703,15 @@ def main():
         (result_df["操作"].isin(["可買", "等待進場"]))
     ].copy()
     filtered = filtered.sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N)
-
     print(f"  符合條件（分數≥{MIN_SCORE}）：{len(filtered)} 支")
+
+    print("抓取 MOPS 重大公告...")
+    mops_news = fetch_mops_news()
+    print(f"  重大公告：{len(mops_news)} 筆")
+
     print("寄送郵件...")
-    send_email(filtered, len(codes))
+    total_scanned = len(codes_tw) + len(codes_two)
+    send_email(filtered, total_scanned, mops_news=mops_news)
     print(f"[{datetime.now():%H:%M:%S}] 完成")
 
 if __name__ == "__main__":
