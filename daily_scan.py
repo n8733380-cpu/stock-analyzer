@@ -3,7 +3,7 @@ daily_scan.py — 每日收盤後自動掃描台股，結果寄至 Gmail
 建議排程時間：18:00（T86 法人資料約 17:30 發布）
 執行時間：約 10-15 分鐘（TWSE 全市場約 900 支）
 """
-import os, sys, smtplib, time, requests, re
+import os, sys, smtplib, time, requests, re, json
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -33,6 +33,47 @@ MOPS_KEYWORDS = [
     "資產處分", "出售土地", "出售廠房", "出售不動產",
     "重大合約", "簽訂合作", "策略合作", "取得重大資產",
 ]
+
+SCAN_HISTORY_FILE = r"E:\私人\股票分析\scan_history.json"
+
+def _load_scan_history():
+    try:
+        with open(SCAN_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_scan_history(today_str, codes):
+    hist = _load_scan_history()
+    hist[today_str] = list(codes)
+    keep = sorted(hist.keys())[-10:]
+    hist = {d: hist[d] for d in keep}
+    try:
+        with open(SCAN_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _count_streak(code, history, today_str):
+    count = 0
+    for d in sorted(history.keys(), reverse=True):
+        if d >= today_str:
+            continue
+        if code in history.get(d, []):
+            count += 1
+        else:
+            break
+    return count
+
+def _extract_trigger_price(patterns):
+    for p in patterns:
+        m = re.search(r'頸線\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'突破點\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
+    return None
 
 # ── 進度列替代（print）────────────────────────────────────────────────────────
 class _Progress:
@@ -237,6 +278,15 @@ def calc_indicators(df, fast_ma, slow_ma):
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     df["RSI14"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+    _atr_s = df["Close"].diff().abs().rolling(14).mean() + 1e-9
+    _hdiff = df["High"].diff()
+    _ldiff = -df["Low"].diff()
+    _plus_dm  = _hdiff.where((_hdiff > _ldiff) & (_hdiff > 0), 0.0)
+    _minus_dm = _ldiff.where((_ldiff > _hdiff) & (_ldiff > 0), 0.0)
+    _plus_di  = 100 * (_plus_dm.rolling(14).mean() / _atr_s)
+    _minus_di = 100 * (_minus_dm.rolling(14).mean() / _atr_s)
+    _dx = 100 * (_plus_di - _minus_di).abs() / (_plus_di + _minus_di + 1e-9)
+    df["ADX14"] = _dx.rolling(14).mean()
     return df, fast_col, slow_col
 
 # ── 型態偵測 ──────────────────────────────────────────────────────────────────
@@ -451,9 +501,10 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
     PAT_W = {"VCP": 12, "杯柄": 10, "雙底": 9, "平台底": 7, "OBV底背離": 8, "RSI底背離": 5}
     score += min(20, sum(w for k, w in PAT_W.items() if any(k in p for p in pos_pats)))
     score -= len(top_divs) * 20
+    _breakout_pat = any(k in p for k in ("VCP", "杯柄") for p in pos_pats)
     if 52 <= rsi_now <= 65:   score += 10
     elif (45 <= rsi_now < 52) or (65 < rsi_now <= 72): score += 5
-    elif rsi_now > 75:        score -= 10
+    elif rsi_now > 75 and not _breakout_pat: score -= 10
     if 3 < r1m <= 15:         score += 10
     elif 0 < r1m <= 3 or 15 < r1m <= 25: score += 5
     elif r1m > 30:            score -= 8
@@ -469,17 +520,15 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
         if -8 <= dist_pct <= 0:     score += 5
         elif -20 <= dist_pct < -8:  score += 3
         elif dist_pct < -40:        score -= 3
-    # MA20 > MA60 長期多頭加分
     if "MA60" in df.columns and pd.notna(df["MA60"].iloc[-1]):
         if pd.notna(df[slow_col].iloc[-1]) and float(df[slow_col].iloc[-1]) > float(df["MA60"].iloc[-1]):
             score += 5
-    # 月營收 YoY 加分
     if revenue_yoy is not None:
         if revenue_yoy >= 30:    score += 15
         elif revenue_yoy >= 15:  score += 8
         elif revenue_yoy >= 5:   score += 3
         elif revenue_yoy <= -20: score -= 8
-    cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
+    cap = 40 if (top_divs or (rsi_now >= 78 and not _breakout_pat) or r1m > 30) else 100
     return max(0, min(cap, score))
 
 # ── 單支股票分析 ───────────────────────────────────────────────────────────────
@@ -536,17 +585,37 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         action = "不看"
     rs_val  = _calc_rs(df, bench_df)
     rsi_cur = float(df["RSI14"].iloc[-1]) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else 50
-    # 跑輸大盤 15% 以上：無論操作類型一律不看
     if rs_val is not None and rs_val < -15:
         action = "不看"
-    # RSI 超買 + 大漲，沒有合理進場時機點
     elif rsi_cur > 73 and _r1m > 18 and action == "等待進場":
         action = "不看"
+    # 收盤 < MA5 → 假突破，降為等待進場
+    if action == "可買":
+        _ma5 = float(df["MA5"].iloc[-1]) if "MA5" in df.columns and pd.notna(df["MA5"].iloc[-1]) else 0
+        if _ma5 > 0 and close < _ma5:
+            action = "等待進場"
+    # ADX < 20 → 盤整市，均線交叉不可信
+    if action == "可買":
+        _adx = float(df["ADX14"].iloc[-1]) if "ADX14" in df.columns and pd.notna(df["ADX14"].iloc[-1]) else 0
+        if _adx < 20:
+            action = "等待進場"
+    # 多訊號確認：黃金交叉需搭配至少 1 個輔助訊號
+    if action == "可買":
+        _vol_avg = df["Volume"].tail(20).mean()
+        _vol_ratio = float(latest["Volume"]) / float(_vol_avg) if pd.notna(_vol_avg) and float(_vol_avg) > 0 else 0
+        _rsi_5d_min = float(df["RSI14"].tail(5).min()) if "RSI14" in df.columns else 50
+        _aux = 0
+        if _vol_ratio >= 1.5:                                    _aux += 1
+        if consol_pat:                                           _aux += 1
+        if _rsi_5d_min <= 40 and rsi_cur > 40:                  _aux += 1
+        if _aux < 1:
+            action = "等待進場"
     score   = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
     high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
     rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
     r1m_val  = round(float(df["R1M"].iloc[-1]), 1) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else None
+    trigger  = _extract_trigger_price(patterns)
     return {
         "分數": score,
         "代號": code,
@@ -562,6 +631,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         "幾天前": days_ago if days_ago < 999 else "—",
         "型態": "、".join(patterns) if patterns else "—",
         "月營收YoY": f"{revenue_yoy:+.0f}%" if revenue_yoy is not None else "—",
+        "觸發價": f"{trigger:.1f}" if trigger is not None else "—",
     }
 
 # ── MOPS 重大公告監控 ─────────────────────────────────────────────────────────
@@ -667,7 +737,7 @@ def send_email(df, total_scanned, mops_news=None):
         body_html = f"<p>今日無分數 ≥ {MIN_SCORE} 且操作建議為「可買」或「等待進場」的股票。</p>"
     else:
         cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
-                "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "型態"]
+                "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "連掃天", "觸發價", "型態"]
         cols = [c for c in cols if c in df.columns]
         # 操作欄用顏色標記
         def _row_color(op):
@@ -779,6 +849,14 @@ def main():
     ].copy()
     filtered = filtered.sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N)
     print(f"  符合條件（分數≥{MIN_SCORE}）：{len(filtered)} 支")
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    hist = _load_scan_history()
+    if not filtered.empty:
+        filtered["連掃天"] = filtered["代號"].apply(
+            lambda c: _count_streak(c, hist, today_str)
+        )
+    _save_scan_history(today_str, filtered["代號"].tolist() if not filtered.empty else [])
 
     print("抓取 MOPS 重大公告...")
     mops_news = fetch_mops_news()
