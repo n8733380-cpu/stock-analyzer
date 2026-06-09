@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 import requests
-import json, os, uuid as _uuid
+import json, os, re, uuid as _uuid
 import time as _time
 
 @st.cache_data(ttl=3600)
@@ -144,6 +144,17 @@ def calc_indicators(df, fast_ma, slow_ma, pivot_window, support_lookback):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
+    # ADX(14)
+    _hdiff = df["High"].diff()
+    _ldiff = -df["Low"].diff()
+    _plus_dm  = _hdiff.where((_hdiff > _ldiff) & (_hdiff > 0), 0.0)
+    _minus_dm = _ldiff.where((_ldiff > _hdiff) & (_ldiff > 0), 0.0)
+    _atr_sm   = df["ATR14"] + 1e-9
+    _plus_di  = 100 * (_plus_dm.rolling(14).mean()  / _atr_sm)
+    _minus_di = 100 * (_minus_dm.rolling(14).mean() / _atr_sm)
+    _dx = 100 * (_plus_di - _minus_di).abs() / (_plus_di + _minus_di + 1e-9)
+    df["ADX14"] = _dx.rolling(14).mean()
+
     if df.empty:
         return df, fast_col, slow_col, []
     cutoff = df.index[-1] - pd.Timedelta(days=support_lookback)
@@ -206,7 +217,7 @@ def _calc_macd(close, fast=12, slow=26, signal=9):
     return macd.values, sig.values, (macd - sig).values
 
 
-def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
+def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
     """
     綜合評分 0-100。
     核心邏輯：訊號時機（35分）主導分數，量能確認（20分）次之，
@@ -301,6 +312,18 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None):
             score += 3
         elif dist_pct < -40:
             score -= 3
+
+    # ── MA20 > MA60 長期多頭（+5）──────────────────────────────────────────
+    if "MA60" in df.columns and pd.notna(df["MA60"].iloc[-1]):
+        if pd.notna(df[slow_col].iloc[-1]) and float(df[slow_col].iloc[-1]) > float(df["MA60"].iloc[-1]):
+            score += 5
+
+    # ── 月營收 YoY 加分 ─────────────────────────────────────────────────
+    if revenue_yoy is not None:
+        if revenue_yoy >= 30:    score += 15
+        elif revenue_yoy >= 15:  score += 8
+        elif revenue_yoy >= 5:   score += 3
+        elif revenue_yoy <= -20: score -= 8
 
     # 頂背離或過度延伸 → 分數上限 40
     cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
@@ -1127,9 +1150,39 @@ def build_chart(df, symbol, fast_col, slow_col, fast_ma, slow_ma, supports, stop
 
 
 # ── 模擬交易 helpers ──────────────────────────────────────────────────────────
-PAPER_FILE      = r"D:\私人\股票分析\paper_trades.json"
-SHEET_ID        = "17o-c7bQXcTk53DwRfQGESnCyxjA2owY8D7-NJzurTxQ"
-EMPTY_TRADES    = {"positions": [], "closed": []}
+PAPER_FILE          = r"E:\私人\股票分析\paper_trades.json"
+SCAN_HISTORY_FILE   = r"E:\私人\股票分析\scan_history.json"
+SHEET_ID            = "17o-c7bQXcTk53DwRfQGESnCyxjA2owY8D7-NJzurTxQ"
+EMPTY_TRADES        = {"positions": [], "closed": []}
+
+def _load_scan_history():
+    try:
+        with open(SCAN_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_scan_history(today_str, codes):
+    hist = _load_scan_history()
+    hist[today_str] = list(codes)
+    keep = sorted(hist.keys())[-10:]
+    hist = {d: hist[d] for d in keep}
+    try:
+        with open(SCAN_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _count_streak(code, history, today_str):
+    count = 0
+    for d in sorted(history.keys(), reverse=True):
+        if d >= today_str:
+            continue
+        if code in history.get(d, []):
+            count += 1
+        else:
+            break
+    return count
 
 @st.cache_resource
 def _get_gsheet():
@@ -1280,6 +1333,56 @@ def fetch_sector_map(suffix):
     except Exception:
         return {}
 
+@st.cache_data(ttl=3600)
+def fetch_monthly_revenue():
+    """抓取最新月營收 YoY，回傳 {代號: yoy_pct}"""
+    from datetime import timedelta
+    result = {}
+    try:
+        import urllib3; urllib3.disable_warnings()
+        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+                         timeout=25, verify=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            for row in r.json():
+                vals = list(row.values())
+                if len(vals) >= 10:
+                    try:
+                        result[str(vals[2]).strip()] = float(vals[9])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    try:
+        import urllib3; urllib3.disable_warnings()
+        from datetime import datetime as _dt
+        today = _dt.today()
+        ref   = (today.replace(day=1) - timedelta(days=1)) if today.day >= 12 \
+                else (today.replace(day=1) - timedelta(days=32))
+        roc_year, month = ref.year - 1911, ref.month
+        url  = "https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs"
+        hdrs = {"User-Agent": "Mozilla/5.0",
+                "Referer": "https://mops.twse.com.tw/mops/web/t05st10",
+                "Content-Type": "application/x-www-form-urlencoded"}
+        payload = {"encodeURIComponent": "1", "step": "1", "firstin": "1",
+                   "off": "1", "TYPEK": "otc", "isnew": "false",
+                   "year": str(roc_year), "month": f"{month:02d}"}
+        r2   = requests.post(url, data=payload, headers=hdrs, timeout=25, verify=False)
+        html = r2.content.decode("utf-8", errors="ignore")
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            if len(cells) >= 10 and len(cells[0]) == 4 and cells[0].isdigit():
+                try:
+                    result[cells[0]] = float(cells[9].replace(",", ""))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return result
+
+
 # ── 批次下載（100支一批，速度遠快於逐支下載）────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_multi(symbols_tuple, period):
@@ -1307,8 +1410,19 @@ def _extract_one(multi_df, symbol, n_syms):
     except Exception:
         return None
 
+def _extract_trigger_price(patterns):
+    for p in patterns:
+        m = re.search(r'頸線\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'突破點\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
+    return None
+
+
 # ── 分析單支股票並回傳結果列 ──────────────────────────────────────────────────
-def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sector="—", use_atr_stop=False, atr_mult=2.0):
+def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sector="—", use_atr_stop=False, atr_mult=2.0, revenue_yoy=None):
     stock_df = stock_df.copy()
     stock_df.index = pd.to_datetime(stock_df.index)
     stock_df = stock_df.dropna(subset=["Close"])
@@ -1390,12 +1504,41 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         elif rr_val is not None and rr_val < 1.5:
             action = "等待進場"
 
-    score    = calc_score(df, patterns, fast_col, slow_col, rs_val)
+    # 收盤 > MA5 過濾：黃金交叉後若收盤已跌回 MA5 以下 → 等待進場
+    if action == "可買":
+        _ma5 = float(df["MA5"].iloc[-1]) if "MA5" in df.columns and pd.notna(df["MA5"].iloc[-1]) else 0
+        if _ma5 > 0 and close < _ma5:
+            action = "等待進場"
+
+    # ADX 趨勢強度過濾：ADX < 20 代表盤整，均線交叉不可信
+    if action == "可買":
+        _adx = float(df["ADX14"].iloc[-1]) if "ADX14" in df.columns and pd.notna(df["ADX14"].iloc[-1]) else 0
+        if _adx < 20:
+            action = "等待進場"
+
+    # 多訊號確認：黃金交叉需搭配至少 1 個輔助訊號才升為可買
+    if action == "可買":
+        _vol_avg = df["Volume"].tail(20).mean()
+        _vol_ratio = float(latest["Volume"]) / float(_vol_avg) if pd.notna(_vol_avg) and float(_vol_avg) > 0 else 0
+        _rsi_now = float(df["RSI14"].iloc[-1]) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else 50
+        _rsi_5d_min = float(df["RSI14"].tail(5).min()) if "RSI14" in df.columns else 50
+        _aux = 0
+        if _vol_ratio >= 1.5:                              _aux += 1  # 量能爆發
+        if consol_pat:                                     _aux += 1  # 整理型態確認
+        if _rsi_5d_min <= 40 and _rsi_now > 40:           _aux += 1  # RSI 從超賣回升
+        if supports:
+            _sup_dist = min((abs(close - s) / close for s in supports if s < close), default=1.0)
+            if _sup_dist <= 0.03:                          _aux += 1  # 支撐反彈 3% 以內
+        if _aux < 1:
+            action = "等待進場"
+
+    score    = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
 
     high_52  = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
     rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
     mom      = _calc_momentum(df)
+    trigger  = _extract_trigger_price(patterns)
 
     def _fmt_mom(key):
         v = mom.get(key)
@@ -1408,6 +1551,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         "產業": sector,
         "收盤價": round(close, 2),
         "止損價": stop_val,
+        "觸發價": f"{trigger:.1f}" if trigger is not None else "—",
         "RSI": rsi_now if rsi_now is not None else "—",
         "RS vs大盤": f"{rs_val:+.1f}%" if (rs_val is not None and not np.isnan(float(rs_val))) else "—",
         "1M%": _fmt_mom("R1M"),
@@ -1423,7 +1567,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
     }
 
 # ── 掃描主函式（批次下載版）────────────────────────────────────────────────────
-def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=None, sector_map=None, use_atr_stop=False, atr_mult=2.0):
+def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=None, sector_map=None, use_atr_stop=False, atr_mult=2.0, revenue_dict=None):
     import time
     results = []
     batch_size = 50 if suffix == ".TWO" else 100
@@ -1451,7 +1595,8 @@ def scan_stocks(codes, suffix, period, fast_ma, slow_ma, stop_pct, pb, bench_df=
                     continue
                 row = _analyze_one(code, sdf, fast_ma, slow_ma, stop_pct, bench_df=bench_df,
                                    sector=sector_map.get(code, "—") if sector_map else "—",
-                                   use_atr_stop=use_atr_stop, atr_mult=atr_mult)
+                                   use_atr_stop=use_atr_stop, atr_mult=atr_mult,
+                                   revenue_yoy=(revenue_dict or {}).get(code))
                 if row:
                     results.append(row)
             except Exception:
@@ -1916,10 +2061,24 @@ with tabs[-4]:
             pb = st.progress(0, text="準備中...")
             _bench       = _fetch_benchmark(period)
             _sector_map  = fetch_sector_map(suffix)
+            with st.spinner("取得月營收資料..."):
+                _rev_dict = fetch_monthly_revenue()
             result_df = scan_stocks(scan_codes, suffix, period, fast_ma, slow_ma, stop_pct, pb,
                                     bench_df=_bench, sector_map=_sector_map,
-                                    use_atr_stop=use_atr_stop, atr_mult=atr_mult)
+                                    use_atr_stop=use_atr_stop, atr_mult=atr_mult,
+                                    revenue_dict=_rev_dict)
             pb.empty()
+            # ── GMM 大盤狀態 banner ──────────────────────────────────────────
+            if _bench is not None and not _bench.empty:
+                _scan_regime = _detect_regime(_bench)
+                if _scan_regime == "空頭":
+                    st.error("大盤 GMM：空頭 — 可買訊號可信度降低，建議觀望或縮減部位")
+                    if "操作" in result_df.columns:
+                        result_df.loc[result_df["操作"] == "可買", "操作"] = "等待進場"
+                elif _scan_regime == "橫盤":
+                    st.warning("大盤 GMM：橫盤 — 個股勝率下降，謹慎操作")
+                else:
+                    st.success("大盤 GMM：多頭 — 趨勢順風")
             # RS vs 產業（方案二：同類股掃描結果中位數）
             if "產業" in result_df.columns and "3M%" in result_df.columns:
                 def _pct_float(s):
@@ -1950,16 +2109,24 @@ with tabs[-4]:
                         lambda c: inst_data.get(c, {}).get("total", 0) // 1000
                     )
 
+            if scan_mode != "自訂清單" and "操作" in result_df.columns:
+                from datetime import datetime as _dtnow
+                _save_scan_history(
+                    _dtnow.now().strftime("%Y-%m-%d"),
+                    result_df[result_df["操作"].isin(["可買", "等待進場"])]["代號"].tolist()
+                )
             st.session_state["scan_result"] = result_df
             st.session_state["scan_key"] = scan_key
-            if use_fin_filter and not result_df.empty:
+            if use_fin_filter and not result_df.empty and "操作" in result_df.columns:
                 cands = result_df[result_df["操作"].isin(["可買", "等待進場"])]
                 if not cands.empty:
                     fin_pb = st.progress(0, text="查詢財務數據...")
                     grade_map = {}
+                    rg_map = {}
                     for _fi, (_idx, _row) in enumerate(cands.iterrows()):
                         fh = _get_fin_health(f"{_row['代號']}{suffix}")
                         grade_map[_idx] = fh["grade"]
+                        rg_map[_idx] = fh["rg"]  # 年度營收成長 %
                         fin_pb.progress((_fi + 1) / len(cands),
                                         text=f"財務 {_fi+1}/{len(cands)}: {_row['代號']}")
                     fin_pb.empty()
@@ -1967,6 +2134,21 @@ with tabs[-4]:
                                     "衰退": "⚠️ 衰退", "虧損": "🚨 虧損"}
                     result_df["財務"] = result_df.index.map(
                         lambda x: _GRADE_EMOJI.get(grade_map.get(x, ""), "—")
+                    )
+                    # 催化劑：年度營收成長 >= 30% 且分數被 RSI 上限壓到 <= 40 → 放寬至最多 70
+                    def _adjust_catalyst(row):
+                        rg = rg_map.get(row.name)
+                        rsi = row.get("RSI")
+                        try:
+                            rsi_val = float(rsi) if rsi not in (None, "—") else 0
+                        except (ValueError, TypeError):
+                            rsi_val = 0
+                        if rg is not None and rg >= 30 and rsi_val >= 78 and row["分數"] <= 40:
+                            return min(70, int(row["分數"] * 1.75))
+                        return row["分數"]
+                    result_df["分數"] = result_df.apply(_adjust_catalyst, axis=1)
+                    result_df["催化劑"] = result_df.index.map(
+                        lambda x: "✅ 業績強" if (rg_map.get(x) is not None and rg_map.get(x) >= 30) else "—"
                     )
                     st.session_state["scan_result"] = result_df
     else:
@@ -1976,6 +2158,12 @@ with tabs[-4]:
         if "財務" in result_df.columns:
             if st.checkbox("排除財務虧損股", value=True, key="excl_fin_risk"):
                 result_df = result_df[~result_df["財務"].str.contains("虧損", na=False)]
+        if "連掃天" not in result_df.columns:
+            from datetime import datetime as _dtnow
+            _today_str = _dtnow.now().strftime("%Y-%m-%d")
+            result_df["連掃天"] = result_df["代號"].apply(
+                lambda c: _count_streak(c, _load_scan_history(), _today_str)
+            )
 
         order = {"近期黃金交叉": 0, "多頭持續中": 1, "觀察中": 2, "近期死亡交叉": 3, "空頭排列": 4}
         result_df["_sort"] = result_df["狀態"].map(order).fillna(9)
@@ -2001,8 +2189,8 @@ with tabs[-4]:
                 if "連買天" in easy_df.columns:
                     easy_df = easy_df.sort_values(["連買天", "分數"], ascending=[False, False])
                 easy_df = easy_df.head(_top_n)
-                show_cols = [c for c in ["分數", "操作", "財務", "連買天", "外資累計(張)",
-                                          "代號", "產業", "收盤價", "止損價",
+                show_cols = [c for c in ["分數", "操作", "財務", "催化劑", "連掃天", "連買天", "外資累計(張)",
+                                          "代號", "產業", "收盤價", "止損價", "觸發價",
                                           "RR", "RSI", "RS vs大盤", "RS vs產業", "1M%", "3M%",
                                           "距52週高%", "偵測型態", "訊號日期"]
                              if c in easy_df.columns]
