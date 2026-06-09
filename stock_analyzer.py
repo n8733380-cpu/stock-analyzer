@@ -273,12 +273,15 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
     # 頂背離重罰（每個 -20）
     score -= len(top_divs) * 20
 
+    # VCP/杯柄 突破時高 RSI 是動能確認，不是過度延伸
+    _breakout_pat = any(k in p for k in ("VCP", "杯柄") for p in pos_pats)
+
     # ── RSI 位置（10分）────────────────────────────────────────────
     if 52 <= rsi_now <= 65:
         score += 10
     elif (45 <= rsi_now < 52) or (65 < rsi_now <= 72):
         score += 5
-    elif rsi_now > 75:
+    elif rsi_now > 75 and not _breakout_pat:
         score -= 10
 
     # ── 1M 動能品質（10分）─────────────────────────────────────────
@@ -325,8 +328,8 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
         elif revenue_yoy >= 5:   score += 3
         elif revenue_yoy <= -20: score -= 8
 
-    # 頂背離或過度延伸 → 分數上限 40
-    cap = 40 if (top_divs or rsi_now >= 78 or r1m > 30) else 100
+    # 頂背離或過度延伸 → 分數上限 40（VCP/杯柄 突破免受 RSI 上限限制）
+    cap = 40 if (top_divs or (rsi_now >= 78 and not _breakout_pat) or r1m > 30) else 100
 
     return max(0, min(cap, score))
 
