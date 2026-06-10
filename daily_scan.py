@@ -24,9 +24,10 @@ FAST_MA   = 5
 SLOW_MA   = 20
 STOP_PCT  = 8
 PERIOD    = "1y"
-MIN_SCORE = 55
-TOP_N     = 15
-SCAN_OTC  = True   # 同時掃上櫃（.TWO）
+MIN_SCORE     = 55   # 上市門檻
+MIN_SCORE_OTC = 45   # 上櫃門檻（無 T86 法人資料，分數天花板較低）
+TOP_N         = 10   # 各市場各取前 N
+SCAN_OTC      = True # 同時掃上櫃（.TWO）
 
 # MOPS 重大公告監控關鍵字
 MOPS_KEYWORDS = [
@@ -741,45 +742,57 @@ def scan_stocks(codes, bench_df, sector_map, suffix=".TW", revenue_dict=None):
     return pd.DataFrame(results)
 
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
-def send_email(df, total_scanned, mops_news=None):
-    _days = ["一", "二", "三", "四", "五", "六", "日"]
-    today = datetime.now().strftime("%Y-%m-%d") + f"（週{_days[datetime.now().weekday()]}）"
-    n     = len(df)
-
-    if df.empty:
-        body_html = f"<p>今日無分數 ≥ {MIN_SCORE} 且操作建議為「可買」或「等待進場」的股票。</p>"
-    else:
-        cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
-                "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "連掃天", "觸發價", "型態"]
-        cols = [c for c in cols if c in df.columns]
-        # 操作欄用顏色標記
-        def _row_color(op):
-            return "#d4edda" if op == "可買" else "#fff3cd" if op == "等待進場" else "white"
-        rows_html = ""
-        for _, r in df.iterrows():
-            bg = _row_color(r.get("操作", ""))
-            cells = "".join(f"<td style='padding:5px 8px;border-bottom:1px solid #ddd'>{r.get(c,'')}</td>" for c in cols)
-            rows_html += f"<tr style='background:{bg}'>{cells}</tr>"
-        headers = "".join(f"<th style='padding:6px 8px;text-align:left;background:#2c3e50;color:white'>{c}</th>" for c in cols)
-        body_html = f"""
-<table style='border-collapse:collapse;width:100%;font-size:13px'>
+def _build_table_html(df, header_color="#2c3e50"):
+    cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
+            "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "連掃天", "觸發價", "型態"]
+    cols = [c for c in cols if c in df.columns]
+    def _row_color(op):
+        return "#d4edda" if op == "可買" else "#fff3cd" if op == "等待進場" else "white"
+    rows_html = ""
+    for _, r in df.iterrows():
+        bg    = _row_color(r.get("操作", ""))
+        cells = "".join(f"<td style='padding:5px 8px;border-bottom:1px solid #ddd'>{r.get(c,'')}</td>" for c in cols)
+        rows_html += f"<tr style='background:{bg}'>{cells}</tr>"
+    headers = "".join(
+        f"<th style='padding:6px 8px;text-align:left;background:{header_color};color:white'>{c}</th>"
+        for c in cols
+    )
+    return f"""<table style='border-collapse:collapse;width:100%;font-size:13px'>
 <thead><tr>{headers}</tr></thead>
 <tbody>{rows_html}</tbody>
 </table>"""
 
-    # MOPS 重大公告區段
+
+def send_email(df_tw, df_otc, total_scanned, mops_news=None):
+    _days = ["一", "二", "三", "四", "五", "六", "日"]
+    today  = datetime.now().strftime("%Y-%m-%d") + f"（週{_days[datetime.now().weekday()]}）"
+    n_tw   = len(df_tw)
+    n_otc  = len(df_otc)
+
+    # ── 上市區塊 ──
+    if df_tw.empty:
+        tw_html = f"<p>今日無上市股票符合條件（分數 ≥ {MIN_SCORE}）。</p>"
+    else:
+        tw_html = _build_table_html(df_tw, header_color="#2c3e50")
+
+    # ── 上櫃區塊 ──
+    if df_otc.empty:
+        otc_html = f"<p>今日無上櫃股票符合條件（分數 ≥ {MIN_SCORE_OTC}）。</p>"
+    else:
+        otc_html = _build_table_html(df_otc, header_color="#1a6b3c")
+
+    # ── MOPS 重大公告 ──
     mops_html = ""
     if mops_news:
-        mops_rows = ""
-        for m in mops_news:
-            mops_rows += (
-                f"<tr>"
-                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['代號']}</td>"
-                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['公司']}</td>"
-                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['時間']}</td>"
-                f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['主旨']}</td>"
-                f"</tr>"
-            )
+        mops_rows = "".join(
+            f"<tr>"
+            f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['代號']}</td>"
+            f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['公司']}</td>"
+            f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['時間']}</td>"
+            f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{m['主旨']}</td>"
+            f"</tr>"
+            for m in mops_news
+        )
         mops_html = f"""
 <h3 style='color:#c0392b;margin-top:30px'>今日重大公告（{len(mops_news)} 筆）</h3>
 <p style='color:#666;font-size:12px'>來源：MOPS 公開資訊觀測站｜含關鍵字：資產處分、重大合約、取得重大資產</p>
@@ -795,8 +808,11 @@ def send_email(df, total_scanned, mops_news=None):
 
     html = f"""<html><body style='font-family:Arial,sans-serif;padding:20px'>
 <h2 style='color:#2c3e50'>台股每日掃描 — {today}</h2>
-<p>掃描 {total_scanned} 支上市＋上櫃股票，共 <b>{n}</b> 支符合條件（分數 ≥ {MIN_SCORE}），依連買天數排序：</p>
-{body_html}
+<p>掃描 {total_scanned} 支股票 | 上市 {n_tw} 支（分數≥{MIN_SCORE}，依連買天排序）/ 上櫃 {n_otc} 支（分數≥{MIN_SCORE_OTC}，依分數排序）</p>
+<h3 style='color:#2c3e50;margin-top:20px'>上市（TWSE）— {n_tw} 支</h3>
+{tw_html}
+<h3 style='color:#1a6b3c;margin-top:30px'>上櫃（TPEX）— {n_otc} 支</h3>
+{otc_html}
 {mops_html}
 <p style='color:#999;font-size:11px;margin-top:20px'>
   均線 MA{FAST_MA}/MA{SLOW_MA} · 止損 {STOP_PCT}% · 期間 {PERIOD} · 綠=可買 黃=等待進場
@@ -804,7 +820,7 @@ def send_email(df, total_scanned, mops_news=None):
 </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"【台股掃描】{datetime.now().strftime('%m/%d')} — {n} 支值得關注"
+    msg["Subject"] = f"【台股掃描】{datetime.now().strftime('%m/%d')} — 上市{n_tw}支 上櫃{n_otc}支"
     msg["From"]    = GMAIL_USER
     msg["To"]      = TO_EMAIL
     msg.attach(MIMEText(html, "html", "utf-8"))
@@ -847,29 +863,42 @@ def main():
                                  revenue_dict=revenue_dict)
         print(f"  上櫃有效：{len(result_two)} 支")
 
-    result_df = pd.concat([result_tw, result_two], ignore_index=True) if not result_two.empty else result_tw
+    # 上市加法人籌碼
+    if not result_tw.empty:
+        result_tw["連買天"]       = result_tw["代號"].map(lambda c: inst_data.get(c, {}).get("consec", 0))
+        result_tw["外資累計(張)"] = result_tw["代號"].map(lambda c: inst_data.get(c, {}).get("total", 0) // 1000)
 
-    if not result_df.empty and inst_data:
-        result_df["連買天"]       = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("consec", 0))
-        result_df["外資累計(張)"] = result_df["代號"].map(lambda c: inst_data.get(c, {}).get("total", 0) // 1000)
-    else:
-        result_df["連買天"]       = 0
-        result_df["外資累計(張)"] = 0
+    # 上櫃無 T86，填 0
+    if not result_two.empty:
+        result_two["連買天"]       = 0
+        result_two["外資累計(張)"] = 0
 
-    filtered = result_df[
-        (result_df["分數"] >= MIN_SCORE) &
-        (result_df["操作"].isin(["可買", "等待進場"]))
-    ].copy()
-    filtered = filtered.sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N)
-    print(f"  符合條件（分數≥{MIN_SCORE}）：{len(filtered)} 支")
+    # 上市：依連買天→分數排序，TOP N
+    filtered_tw = pd.DataFrame()
+    if not result_tw.empty:
+        filtered_tw = result_tw[
+            (result_tw["分數"] >= MIN_SCORE) &
+            (result_tw["操作"].isin(["可買", "等待進場"]))
+        ].sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N).copy()
+        print(f"  上市符合（分數≥{MIN_SCORE}）：{len(filtered_tw)} 支")
+
+    # 上櫃：獨立門檻，依分數排序，TOP N
+    filtered_otc = pd.DataFrame()
+    if not result_two.empty:
+        filtered_otc = result_two[
+            (result_two["分數"] >= MIN_SCORE_OTC) &
+            (result_two["操作"].isin(["可買", "等待進場"]))
+        ].sort_values("分數", ascending=False).head(TOP_N).copy()
+        print(f"  上櫃符合（分數≥{MIN_SCORE_OTC}）：{len(filtered_otc)} 支")
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     hist = _load_scan_history()
-    if not filtered.empty:
-        filtered["連掃天"] = filtered["代號"].apply(
-            lambda c: _count_streak(c, hist, today_str)
-        )
-    _save_scan_history(today_str, filtered["代號"].tolist() if not filtered.empty else [])
+    for df_ in [filtered_tw, filtered_otc]:
+        if not df_.empty:
+            df_["連掃天"] = df_["代號"].apply(lambda c: _count_streak(c, hist, today_str))
+    all_codes = (filtered_tw["代號"].tolist() if not filtered_tw.empty else []) + \
+                (filtered_otc["代號"].tolist() if not filtered_otc.empty else [])
+    _save_scan_history(today_str, all_codes)
 
     print("抓取 MOPS 重大公告...")
     mops_news = fetch_mops_news()
@@ -877,7 +906,7 @@ def main():
 
     print("寄送郵件...")
     total_scanned = len(codes_tw) + len(codes_two)
-    send_email(filtered, total_scanned, mops_news=mops_news)
+    send_email(filtered_tw, filtered_otc, total_scanned, mops_news=mops_news)
     print(f"[{datetime.now():%H:%M:%S}] 完成")
 
 if __name__ == "__main__":
