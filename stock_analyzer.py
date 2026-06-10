@@ -596,6 +596,81 @@ def run_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
     return stats, trades_df, eq_s, bh_eq
 
 
+def run_pattern_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
+                         initial_capital=1_000_000,
+                         stop_pct=7, use_atr_stop=False, atr_mult=2.0):
+    """
+    走步前進回測：型態突破策略。
+    入場：型態成立 + 收盤在觸發價 -2%~+8% + MA快>MA慢 + ADX≥20 + 無頂背離
+    出場：死叉 or 止損（交由 run_backtest 處理，邏輯與 MA 策略相同）
+    注意：pivot 偵測使用 ±5 根視窗，最後 5 根 K 棒的 pivot 確認有輕微前瞻偏差，
+          與實盤系統一致，屬可接受範圍。
+    """
+    n = len(df)
+    sig = np.zeros(n, dtype=int)
+    MIN_BARS = 65
+
+    fc_arr  = df[fast_col].values.astype(float)
+    sc_arr  = df[slow_col].values.astype(float)
+    adx_arr = df["ADX14"].values.astype(float) if "ADX14" in df.columns else np.full(n, np.nan)
+
+    for i in range(MIN_BARS, n):
+        sub = df.iloc[:i + 1]
+        c   = sub["Close"].values.astype(float)
+        v   = sub["Volume"].values.astype(float)
+
+        # 型態偵測
+        pats = []
+        for fn, needs_v in [(_detect_vcp,          True),
+                             (_detect_flat_base,    True),
+                             (_detect_double_bottom, False),
+                             (_detect_cup_handle,   True)]:
+            r = fn(c, v) if needs_v else fn(c)
+            if r:
+                pats.append(r)
+        if not pats:
+            continue
+
+        trigger = _extract_trigger_price(pats)
+        if trigger is None:
+            continue
+
+        close = c[-1]
+        if not (trigger * 0.98 <= close <= trigger * 1.08):
+            continue
+
+        # MA 趨勢確認
+        mf, ms = fc_arr[i], sc_arr[i]
+        if np.isnan(mf) or np.isnan(ms) or mf <= ms:
+            continue
+
+        # ADX ≥ 20
+        adx = adx_arr[i]
+        if np.isnan(adx) or adx < 20:
+            continue
+
+        # 頂背離過濾
+        if any("頂背離" in d for d in _detect_divergence(sub)):
+            continue
+
+        sig[i] = 1
+
+    # 死叉 → 出場訊號（與 MA 策略一致）
+    for i in range(1, n):
+        fpr, spr = fc_arr[i - 1], sc_arr[i - 1]
+        fcr, scr = fc_arr[i],     sc_arr[i]
+        if not any(np.isnan(x) for x in [fpr, spr, fcr, scr]):
+            if fpr > spr and fcr <= scr:
+                sig[i] = -1
+
+    df2 = df.copy()
+    df2["signal"] = sig
+    return run_backtest(df2, fast_col, slow_col, fast_ma, slow_ma,
+                        initial_capital=initial_capital,
+                        use_atr_stop=use_atr_stop, atr_mult=atr_mult,
+                        stop_pct=stop_pct)
+
+
 @st.cache_data(ttl=1800)
 def _detect_regime(df, n_states=3):
     """
@@ -2408,7 +2483,6 @@ with tabs[-3]:
 # ── 回測頁 ───────────────────────────────────────────────────────────────────
 with tabs[-2]:
     st.subheader("策略回測")
-    st.caption(f"均線交叉訊號（MA{fast_ma} vs MA{slow_ma}），含台股手續費（買 0.0855%，賣 0.3855%）")
 
     bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 2, 2, 1])
     with bt_c1:
@@ -2423,11 +2497,24 @@ with tabs[-2]:
         st.write("")
         bt_run = st.button("執行回測", use_container_width=True, key="bt_run")
 
-    bt_key = f"{bt_code}|{bt_exch}|{bt_period}|{bt_capital}|{fast_ma}|{slow_ma}|{stop_pct}|atr={use_atr_stop}"
+    bt_use_pattern = st.toggle(
+        "型態突破策略（走步前進）",
+        value=False, key="bt_use_pattern",
+        help="關閉：MA 黃金交叉/死叉。開啟：VCP/杯柄/雙底/平台底 + 觸發窗口，走步前進計算，速度較慢。"
+    )
+    if bt_use_pattern:
+        st.caption(f"型態突破策略（走步前進）｜出場：死叉 or 止損 {stop_pct}%｜含台股手續費")
+    else:
+        st.caption(f"均線交叉訊號（MA{fast_ma} vs MA{slow_ma}）｜含台股手續費（買 0.0855%，賣 0.3855%）")
+
+    bt_key = (f"{bt_code}|{bt_exch}|{bt_period}|{bt_capital}"
+              f"|{fast_ma}|{slow_ma}|{stop_pct}|atr={use_atr_stop}|pat={bt_use_pattern}")
     if bt_run or ("bt_result" in st.session_state and st.session_state.get("bt_key") == bt_key):
         if bt_run or "bt_result" not in st.session_state:
             bt_sym = f"{bt_code}{bt_exch}"
-            with st.spinner(f"下載 {bt_sym} 並執行回測..."):
+            spinner_msg = (f"下載 {bt_sym} 並執行型態突破回測（走步前進，需 10~30 秒）..."
+                           if bt_use_pattern else f"下載 {bt_sym} 並執行回測...")
+            with st.spinner(spinner_msg):
                 try:
                     bt_raw = fetch(bt_sym, bt_period)
                 except Exception as e:
@@ -2438,20 +2525,30 @@ with tabs[-2]:
                 bt_df, bt_fc, bt_sc, _ = calc_indicators(
                     bt_raw, fast_ma, slow_ma, pivot_window, support_lookback
                 )
-                bt_stats, bt_trades, bt_eq, bt_bh = run_backtest(
-                    bt_df, bt_fc, bt_sc, fast_ma, slow_ma,
-                    initial_capital=float(bt_capital),
-                    use_atr_stop=use_atr_stop, atr_mult=atr_mult, stop_pct=stop_pct
-                )
+                if bt_use_pattern:
+                    bt_stats, bt_trades, bt_eq, bt_bh = run_pattern_backtest(
+                        bt_df, bt_fc, bt_sc, fast_ma, slow_ma,
+                        initial_capital=float(bt_capital),
+                        use_atr_stop=use_atr_stop, atr_mult=atr_mult, stop_pct=stop_pct
+                    )
+                else:
+                    bt_stats, bt_trades, bt_eq, bt_bh = run_backtest(
+                        bt_df, bt_fc, bt_sc, fast_ma, slow_ma,
+                        initial_capital=float(bt_capital),
+                        use_atr_stop=use_atr_stop, atr_mult=atr_mult, stop_pct=stop_pct
+                    )
                 st.session_state["bt_result"] = (bt_stats, bt_trades, bt_eq, bt_bh)
                 st.session_state["bt_key"] = bt_key
                 st.session_state["bt_sym_used"] = bt_code
+                st.session_state["bt_strategy_used"] = "pattern" if bt_use_pattern else "ma"
             else:
                 st.error(f"找不到 {bt_sym}")
 
         if "bt_result" in st.session_state:
             bt_stats, bt_trades, bt_eq, bt_bh = st.session_state["bt_result"]
-            bt_sym_used = st.session_state.get("bt_sym_used", bt_code)
+            bt_sym_used     = st.session_state.get("bt_sym_used", bt_code)
+            bt_strategy_used = st.session_state.get("bt_strategy_used", "ma")
+            bt_strat_label  = "型態突破" if bt_strategy_used == "pattern" else f"MA{fast_ma}×MA{slow_ma}"
 
             # ── 績效指標 ──────────────────────────────────────────────────────
             r1, r2, r3, r4, r5, r6 = st.columns(6)
@@ -2484,7 +2581,7 @@ with tabs[-2]:
             fig_eq = go.Figure()
             fig_eq.add_trace(go.Scatter(
                 x=bt_eq.index, y=bt_eq.values,
-                name=f"策略（MA{fast_ma}×MA{slow_ma}）",
+                name=f"策略（{bt_strat_label}）",
                 line=dict(color="#42A5F5", width=2)
             ))
             fig_eq.add_trace(go.Scatter(
