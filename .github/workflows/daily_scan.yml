@@ -5,6 +5,9 @@ on:
     - cron: '0 10 * * 1-5'  # 10:00 UTC = 18:00 台灣時間（T86 發布後 30 分鐘）
   workflow_dispatch:         # 允許手動觸發
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
