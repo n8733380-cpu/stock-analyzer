@@ -622,7 +622,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         if _aux < 1:
             action = "等待進場"
 
-    _CYCLICAL = {"建材營造業", "水泥工業"}
+    _CYCLICAL = {"建材營造業", "水泥工業", "汽車工業"}
     if action == "可買" and sector in _CYCLICAL:
         if revenue_yoy is None or revenue_yoy <= 0:
             action = "等待進場"

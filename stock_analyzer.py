@@ -1652,7 +1652,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
             action = "等待進場"
 
     # 景氣循環產業：無月營收成長支撐時，可買降為等待進場
-    _CYCLICAL = {"建材營造業", "水泥工業"}
+    _CYCLICAL = {"建材營造業", "水泥工業", "汽車工業"}
     if action == "可買" and sector in _CYCLICAL:
         if revenue_yoy is None or revenue_yoy <= 0:
             action = "等待進場"
@@ -1944,9 +1944,14 @@ for tab, code in zip(tabs, stock_codes):
         else:
             action_q = "不看"
 
-        _CYCLICAL_Q = {"建材營造業", "水泥工業"}
+        _CYCLICAL_Q = {"建材營造業", "水泥工業", "汽車工業"}
         if action_q == "可買" and _sector_q in _CYCLICAL_Q:
-            action_q = "等待進場"
+            try:
+                _rev_yoy_q = fetch_monthly_revenue().get(code, None)
+            except Exception:
+                _rev_yoy_q = None
+            if _rev_yoy_q is None or _rev_yoy_q <= 0:
+                action_q = "等待進場"
 
         # 突破量能確認
         if action_q == "可買":
