@@ -733,7 +733,7 @@ def _detect_vcp(c, v):
         li = nxt[0]
         pct = (c[hi] - c[li]) / c[hi] * 100
         avg_v = float(np.mean(v[max(0, li-3):li+4]))
-        corrs.append((pct, avg_v))
+        corrs.append((pct, avg_v, float(c[hi])))
     if len(corrs) < 3:
         return None
     recent = corrs[-4:]
@@ -742,7 +742,8 @@ def _detect_vcp(c, v):
         return None
     vol_ok = all(recent[i][1] >= recent[i+1][1] for i in range(len(recent)-1))
     strength = "強" if (vol_ok and len(recent) >= 3) else "中"
-    return f"VCP {len(recent)}次收縮（{strength}）"
+    last_hi = recent[-1][2]
+    return f"VCP {len(recent)}次收縮（{strength}），觸發 {last_hi:.1f}"
 
 
 def _detect_double_bottom(c):
@@ -793,7 +794,7 @@ def _detect_flat_base(c, v):
         mid = period // 2
         vol_ratio = np.mean(sv[mid:]) / (np.mean(sv[:mid]) + 1e-9)
         note = "量縮" if vol_ratio < 0.85 else ""
-        return f"平台底 {period}日，波動 {rng:.1f}%{(' '+note) if note else ''}"
+        return f"平台底 {period}日，波動 {rng:.1f}%{(' '+note) if note else ''}，觸發 {h:.1f}"
     return None
 
 
@@ -1421,6 +1422,9 @@ def _extract_trigger_price(patterns):
         m = re.search(r'突破點\s*([\d.]+)', p)
         if m:
             return float(m.group(1))
+        m = re.search(r'觸發\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
     return None
 
 
@@ -1476,16 +1480,20 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
            if len(df) > 63 else 0
     is_extended = (_r1m > 25 and not consol_pat) or (_r3m > 60 and not consol_pat)
 
+    # 型態突破偵測：所有型態現在都有觸發價，進場窗口 -2% ~ +8%
+    _trigger = _extract_trigger_price(patterns)
+    broke_out = (_trigger is not None and _trigger * 0.98 <= close <= _trigger * 1.08)
+
     if top_divs:
         action = "不看"
     elif is_extended:
         action = "不看"
-    elif trend == "多頭" and tag == "近期黃金交叉":
-        action = "可買"
-    elif trend == "多頭" and (tag == "多頭持續中" or consol_pat):
-        action = "等待進場"
-    elif trend == "多頭" and tag == "觀察中" and consol_pat:
-        action = "等待進場"
+    elif consol_pat and broke_out and trend == "多頭":
+        action = "可買"        # 型態突破為主訊號
+    elif consol_pat and trend == "多頭":
+        action = "等待進場"    # 型態成形，等突破
+    elif trend == "多頭" and tag in ("近期黃金交叉", "多頭持續中"):
+        action = "等待進場"    # 純均線訊號，無型態
     else:
         action = "不看"
 
@@ -1533,6 +1541,12 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
             _sup_dist = min((abs(close - s) / close for s in supports if s < close), default=1.0)
             if _sup_dist <= 0.03:                          _aux += 1  # 支撐反彈 3% 以內
         if _aux < 1:
+            action = "等待進場"
+
+    # 景氣循環產業：無月營收成長支撐時，可買降為等待進場
+    _CYCLICAL = {"建材營造業", "水泥工業"}
+    if action == "可買" and sector in _CYCLICAL:
+        if revenue_yoy is None or revenue_yoy <= 0:
             action = "等待進場"
 
     score    = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
@@ -1789,16 +1803,30 @@ for tab, code in zip(tabs, stock_codes):
                  if len(df) > 63 else 0
         _ext_q = (_r1m_q > 25 and not _consol_q) or (_r3m_q > 60 and not _consol_q)
 
+        _trigger_q = _extract_trigger_price(pats_q)
+        _broke_q   = (_trigger_q is not None and _trigger_q * 0.98 <= close <= _trigger_q * 1.08)
+        try:
+            _, _smap_q = _parse_isin_page(2 if suffix == ".TW" else 4)
+            _sector_q  = _smap_q.get(code, "—")
+        except Exception:
+            _sector_q  = "—"
+
         if _top_div_q:
             action_q = "不看"
         elif _ext_q:
             action_q = "不看"
-        elif gap_now > 0 and last_q == 1 and days_q <= 5:
+        elif _consol_q and _broke_q and gap_now > 0:
             action_q = "可買"
-        elif gap_now > 0 and (_consol_q or (last_q == 1 and days_q <= 60)):
+        elif _consol_q and gap_now > 0:
+            action_q = "等待進場"
+        elif gap_now > 0 and last_q == 1 and days_q <= 5:
             action_q = "等待進場"
         else:
             action_q = "不看"
+
+        _CYCLICAL_Q = {"建材營造業", "金融保險業", "鋼鐵工業", "航運業", "紡織纖維", "橡膠工業", "造紙工業", "水泥工業"}
+        if action_q == "可買" and _sector_q in _CYCLICAL_Q:
+            action_q = "等待進場"
 
         if use_atr_stop and "ATR14" in df.columns:
             atr_now = float(latest["ATR14"])
@@ -1846,11 +1874,7 @@ for tab, code in zip(tabs, stock_codes):
         # ── 財務健康 ────────────────────────────────────────────────────────────
         with st.spinner("查詢財務數據..."):
             fin = _get_fin_health(symbol)
-        try:
-            _, _smap = _parse_isin_page(2 if suffix == ".TW" else 4)
-            _sector_label = _smap.get(code, "—")
-        except Exception:
-            _sector_label = "—"
+        _sector_label = _sector_q
         grade = fin["grade"]
         _FIN_STYLE = {
             "良好":   ("success", "✅ 財務良好"),

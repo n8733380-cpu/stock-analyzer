@@ -73,6 +73,9 @@ def _extract_trigger_price(patterns):
         m = re.search(r'突破點\s*([\d.]+)', p)
         if m:
             return float(m.group(1))
+        m = re.search(r'觸發\s*([\d.]+)', p)
+        if m:
+            return float(m.group(1))
     return None
 
 # ── 進度列替代（print）────────────────────────────────────────────────────────
@@ -312,7 +315,7 @@ def _detect_vcp(c, v):
         li = nxt[0]
         pct = (c[hi] - c[li]) / c[hi] * 100
         avg_v = float(np.mean(v[max(0, li-3):li+4]))
-        corrs.append((pct, avg_v))
+        corrs.append((pct, avg_v, float(c[hi])))
     if len(corrs) < 3:
         return None
     recent = corrs[-4:]
@@ -321,7 +324,8 @@ def _detect_vcp(c, v):
         return None
     vol_ok = all(recent[i][1] >= recent[i+1][1] for i in range(len(recent)-1))
     strength = "強" if (vol_ok and len(recent) >= 3) else "中"
-    return f"VCP {len(recent)}次收縮（{strength}）"
+    last_hi = recent[-1][2]
+    return f"VCP {len(recent)}次收縮（{strength}），觸發 {last_hi:.1f}"
 
 def _detect_double_bottom(c):
     n = len(c)
@@ -365,7 +369,7 @@ def _detect_flat_base(c, v):
         mid = period // 2
         vol_ratio = np.mean(sv[mid:]) / (np.mean(sv[:mid]) + 1e-9)
         note = "量縮" if vol_ratio < 0.85 else ""
-        return f"平台底 {period}日，波動 {rng:.1f}%{(' '+note) if note else ''}"
+        return f"平台底 {period}日，波動 {rng:.1f}%{(' '+note) if note else ''}，觸發 {h:.1f}"
     return None
 
 def _detect_cup_handle(c, v):
@@ -571,15 +575,18 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     _r1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-21]) - 1) * 100 if len(df) > 21 else 0
     _r3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-63]) - 1) * 100 if len(df) > 63 else 0
     is_extended = (_r1m > 25 and not consol_pat) or (_r3m > 60 and not consol_pat)
+    _trigger = _extract_trigger_price(patterns)
+    broke_out = (_trigger is not None and _trigger * 0.98 <= close <= _trigger * 1.08)
+
     if top_divs:
         action = "不看"
     elif is_extended:
         action = "不看"
-    elif trend == "多頭" and tag == "近期黃金交叉":
+    elif consol_pat and broke_out and trend == "多頭":
         action = "可買"
-    elif trend == "多頭" and (tag == "多頭持續中" or consol_pat):
+    elif consol_pat and trend == "多頭":
         action = "等待進場"
-    elif trend == "多頭" and tag == "觀察中" and consol_pat:
+    elif trend == "多頭" and tag in ("近期黃金交叉", "多頭持續中"):
         action = "等待進場"
     else:
         action = "不看"
@@ -610,6 +617,12 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         if _rsi_5d_min <= 40 and rsi_cur > 40:                  _aux += 1
         if _aux < 1:
             action = "等待進場"
+
+    _CYCLICAL = {"建材營造業", "水泥工業"}
+    if action == "可買" and sector in _CYCLICAL:
+        if revenue_yoy is None or revenue_yoy <= 0:
+            action = "等待進場"
+
     score   = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
     high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
