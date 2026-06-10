@@ -653,6 +653,21 @@ def run_pattern_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
         if any("頂背離" in d for d in _detect_divergence(sub)):
             continue
 
+        # 突破量能確認
+        vol_avg20 = float(np.mean(v[-20:])) if len(v) >= 20 else 0
+        if vol_avg20 > 0 and v[-1] < vol_avg20 * 1.5:
+            continue
+
+        # 收法確認：收陽線且收在當日振幅上段 ≥ 60%
+        if "High" in sub.columns and "Low" in sub.columns and "Open" in sub.columns:
+            _h = float(sub["High"].iloc[-1])
+            _l = float(sub["Low"].iloc[-1])
+            _o = float(sub["Open"].iloc[-1])
+            _rng = _h - _l
+            _pos_ok = (_rng <= 0) or ((close - _l) / _rng >= 0.6)
+            if not (_pos_ok and close >= _o):
+                continue
+
         sig[i] = 1
 
     # 死叉 → 出場訊號（與 MA 策略一致）
@@ -1603,6 +1618,23 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         if _adx < 20:
             action = "等待進場"
 
+    # 突破量能確認：量縮突破勝率低，需突破日成交量 ≥ 20 日均量 × 1.5
+    if action == "可買":
+        _vol_avg20 = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
+        _vol_today = float(latest["Volume"]) if pd.notna(latest.get("Volume", np.nan)) else 0
+        if _vol_avg20 > 0 and _vol_today < _vol_avg20 * 1.5:
+            action = "等待進場"
+
+    # 收法確認：收陽線且收盤在當日振幅上段（≥ 60% 位置），排除上影線假突破
+    if action == "可買":
+        _h = float(latest["High"])  if pd.notna(latest.get("High",  np.nan)) else close
+        _l = float(latest["Low"])   if pd.notna(latest.get("Low",   np.nan)) else close
+        _o = float(latest["Open"])  if pd.notna(latest.get("Open",  np.nan)) else close
+        _rng = _h - _l
+        _pos_ok = (_rng <= 0) or ((close - _l) / _rng >= 0.6)
+        if not (_pos_ok and close >= _o):
+            action = "等待進場"
+
     # 多訊號確認：黃金交叉需搭配至少 1 個輔助訊號才升為可買
     if action == "可買":
         _vol_avg = df["Volume"].tail(20).mean()
@@ -1903,6 +1935,23 @@ for tab, code in zip(tabs, stock_codes):
         _CYCLICAL_Q = {"建材營造業", "水泥工業"}
         if action_q == "可買" and _sector_q in _CYCLICAL_Q:
             action_q = "等待進場"
+
+        # 突破量能確認
+        if action_q == "可買":
+            _vol_avg20_q = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
+            _vol_today_q = float(latest["Volume"]) if pd.notna(latest.get("Volume", np.nan)) else 0
+            if _vol_avg20_q > 0 and _vol_today_q < _vol_avg20_q * 1.5:
+                action_q = "等待進場"
+
+        # 收法確認
+        if action_q == "可買":
+            _h_q = float(latest["High"])  if pd.notna(latest.get("High",  np.nan)) else close
+            _l_q = float(latest["Low"])   if pd.notna(latest.get("Low",   np.nan)) else close
+            _o_q = float(latest["Open"])  if pd.notna(latest.get("Open",  np.nan)) else close
+            _rng_q = _h_q - _l_q
+            _pos_ok_q = (_rng_q <= 0) or ((close - _l_q) / _rng_q >= 0.6)
+            if not (_pos_ok_q and close >= _o_q):
+                action_q = "等待進場"
 
         if use_atr_stop and "ATR14" in df.columns:
             atr_now = float(latest["ATR14"])
