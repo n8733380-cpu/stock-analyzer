@@ -35,7 +35,7 @@ MOPS_KEYWORDS = [
     "重大合約", "簽訂合作", "策略合作", "取得重大資產",
 ]
 
-SCAN_HISTORY_FILE = r"E:\私人\股票分析\scan_history.json"
+SCAN_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history.json")
 
 def _load_scan_history():
     try:
