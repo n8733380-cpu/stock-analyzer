@@ -282,7 +282,10 @@ def calc_indicators(df, fast_ma, slow_ma):
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     df["RSI14"] = 100 - 100 / (1 + gain / (loss + 1e-9))
-    _atr_s = df["Close"].diff().abs().rolling(14).mean() + 1e-9
+    _hl = df["High"] - df["Low"]
+    _hc = (df["High"] - df["Close"].shift()).abs()
+    _lc = (df["Low"]  - df["Close"].shift()).abs()
+    _atr_s = pd.concat([_hl, _hc, _lc], axis=1).max(axis=1).rolling(14).mean() + 1e-9
     _hdiff = df["High"].diff()
     _ldiff = -df["Low"].diff()
     _plus_dm  = _hdiff.where((_hdiff > _ldiff) & (_hdiff > 0), 0.0)

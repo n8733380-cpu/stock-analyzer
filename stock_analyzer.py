@@ -1154,8 +1154,9 @@ def build_chart(df, symbol, fast_col, slow_col, fast_ma, slow_ma, supports, stop
 
 
 # ── 模擬交易 helpers ──────────────────────────────────────────────────────────
-PAPER_FILE          = r"E:\私人\股票分析\paper_trades.json"
-SCAN_HISTORY_FILE   = r"E:\私人\股票分析\scan_history.json"
+_BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+PAPER_FILE          = os.path.join(_BASE_DIR, "paper_trades.json")
+SCAN_HISTORY_FILE   = os.path.join(_BASE_DIR, "scan_history.json")
 SHEET_ID            = "17o-c7bQXcTk53DwRfQGESnCyxjA2owY8D7-NJzurTxQ"
 EMPTY_TRADES        = {"positions": [], "closed": []}
 
@@ -1538,7 +1539,7 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         if consol_pat:                                     _aux += 1  # 整理型態確認
         if _rsi_5d_min <= 40 and _rsi_now > 40:           _aux += 1  # RSI 從超賣回升
         if supports:
-            _sup_dist = min((abs(close - s) / close for s in supports if s < close), default=1.0)
+            _sup_dist = min(((close - s) / s for s in supports if s < close), default=1.0)
             if _sup_dist <= 0.03:                          _aux += 1  # 支撐反彈 3% 以內
         if _aux < 1:
             action = "等待進場"
@@ -1824,7 +1825,7 @@ for tab, code in zip(tabs, stock_codes):
         else:
             action_q = "不看"
 
-        _CYCLICAL_Q = {"建材營造業", "金融保險業", "鋼鐵工業", "航運業", "紡織纖維", "橡膠工業", "造紙工業", "水泥工業"}
+        _CYCLICAL_Q = {"建材營造業", "水泥工業"}
         if action_q == "可買" and _sector_q in _CYCLICAL_Q:
             action_q = "等待進場"
 
