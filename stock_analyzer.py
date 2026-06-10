@@ -1657,6 +1657,18 @@ def _analyze_one(code, stock_df, fast_ma, slow_ma, stop_pct, bench_df=None, sect
         if revenue_yoy is None or revenue_yoy <= 0:
             action = "等待進場"
 
+    # 細分「等待進場」語意
+    # broke_out=True 代表在觸發窗口內但某條件未達標（被從可買降下來）
+    # broke_out=False 且 close > trigger*1.08 代表已超出窗口（已錯過）
+    # 其他 consol_pat 情況 = 型態成形、尚未觸發（等突破）
+    if action == "等待進場" and consol_pat:
+        if broke_out:
+            action = "條件未足"
+        elif _trigger is not None and close > _trigger * 1.08:
+            action = "已錯過"
+        else:
+            action = "等突破"
+
     score    = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
 
     high_52  = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
@@ -1953,6 +1965,15 @@ for tab, code in zip(tabs, stock_codes):
             if not (_pos_ok_q and close >= _o_q):
                 action_q = "等待進場"
 
+        # 細分「等待進場」語意（同 _analyze_one 邏輯）
+        if action_q == "等待進場" and _consol_q:
+            if _broke_q:
+                action_q = "條件未足"
+            elif _trigger_q is not None and close > _trigger_q * 1.08:
+                action_q = "已錯過"
+            else:
+                action_q = "等突破"
+
         if use_atr_stop and "ATR14" in df.columns:
             atr_now = float(latest["ATR14"])
             stop_q  = round(close - atr_mult * atr_now, 2)
@@ -1975,6 +1996,12 @@ for tab, code in zip(tabs, stock_codes):
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         if action_q == "可買":
             c1.success("**✅ 可買（訊號確認）**")
+        elif action_q == "條件未足":
+            c1.warning("**⚠️ 條件未足（在窗口）**")
+        elif action_q == "等突破":
+            c1.info("**⚡ 等突破**")
+        elif action_q == "已錯過":
+            c1.warning("**⏭ 已錯過**")
         elif action_q == "等待進場":
             c1.warning("**⏳ 等待進場**")
         else:
@@ -2226,7 +2253,7 @@ with tabs[-4]:
                 if _scan_regime == "空頭":
                     st.error("大盤 GMM：空頭 — 可買訊號可信度降低，建議觀望或縮減部位")
                     if "操作" in result_df.columns:
-                        result_df.loc[result_df["操作"] == "可買", "操作"] = "等待進場"
+                        result_df.loc[result_df["操作"] == "可買", "操作"] = "條件未足"
                 elif _scan_regime == "橫盤":
                     st.warning("大盤 GMM：橫盤 — 個股勝率下降，謹慎操作")
                 else:
@@ -2265,12 +2292,12 @@ with tabs[-4]:
                 from datetime import datetime as _dtnow
                 _save_scan_history(
                     _dtnow.now().strftime("%Y-%m-%d"),
-                    result_df[result_df["操作"].isin(["可買", "等待進場"])]["代號"].tolist()
+                    result_df[result_df["操作"].isin(["可買", "條件未足", "等突破", "等待進場"])]["代號"].tolist()
                 )
             st.session_state["scan_result"] = result_df
             st.session_state["scan_key"] = scan_key
             if use_fin_filter and not result_df.empty and "操作" in result_df.columns:
-                cands = result_df[result_df["操作"].isin(["可買", "等待進場"])]
+                cands = result_df[result_df["操作"].isin(["可買", "條件未足", "等突破", "等待進場"])]
                 if not cands.empty:
                     fin_pb = st.progress(0, text="查詢財務數據...")
                     grade_map = {}
@@ -2330,16 +2357,44 @@ with tabs[-4]:
         exit_df  = result_df[result_df["狀態"].isin(["近期死亡交叉", "空頭排列"])]
 
         # ── 簡易操作清單（最頂端）────────────────────────────────────────────────
+        _ALL_ACTIONS = ["可買", "條件未足", "等突破", "等待進場"]
+        _ACTION_RANK = {"可買": 0, "條件未足": 1, "等突破": 2, "等待進場": 3}
+        _OP_LABEL    = {
+            "可買":   "✅ 可買",
+            "條件未足": "⚠️ 條件未足",
+            "等突破": "⚡ 等突破",
+            "等待進場": "⏳ 等待進場",
+            "已錯過": "⏭ 已錯過",
+        }
+
+        def _trigger_dist(row):
+            try:
+                tv = float(str(row.get("觸發價", "0")))
+                c  = float(row.get("收盤價", 0))
+                return (tv - c) / tv if tv > 0 else 1.0
+            except Exception:
+                return 1.0
+
         if "操作" in result_df.columns:
-            buy_now  = result_df[result_df["操作"] == "可買"]
-            wait_buy = result_df[result_df["操作"] == "等待進場"]
-            easy_df  = pd.concat([buy_now, wait_buy], ignore_index=True)
+            easy_df = result_df[result_df["操作"].isin(_ALL_ACTIONS)].copy()
             if not easy_df.empty:
+                # 排序：可買/條件未足 依連買天↓分數↓；等突破 依距觸發距離↑；等待進場 依分數↓
+                easy_df["_rank"]  = easy_df["操作"].map(_ACTION_RANK).fillna(9)
+                easy_df["_dist"]  = easy_df.apply(_trigger_dist, axis=1)
+                _consec = pd.to_numeric(easy_df["連買天"], errors="coerce").fillna(0) \
+                          if "連買天" in easy_df.columns else pd.Series(0, index=easy_df.index)
+                easy_df["_consec"] = _consec
+                easy_df["_key2"] = easy_df.apply(
+                    lambda r: r["_dist"] if r["操作"] == "等突破" else -r["_consec"],
+                    axis=1
+                )
+                easy_df = easy_df.sort_values(
+                    ["_rank", "_key2", "分數"], ascending=[True, True, False]
+                ).drop(columns=["_rank", "_dist", "_consec", "_key2"])
+
                 _top_n = st.slider("顯示前幾名", 10, 50, 20, key="top_n_slider")
-                st.markdown(f"### 操作建議清單（前 {_top_n} 名，依分數排序）")
-                # 有法人資料時，在操作清單內按連買天降序排
-                if "連買天" in easy_df.columns:
-                    easy_df = easy_df.sort_values(["連買天", "分數"], ascending=[False, False])
+                st.markdown(f"### 操作建議清單（前 {_top_n} 名）")
+                st.caption("✅可買 → ⚠️條件未足（在窗口）→ ⚡等突破（最近觸發優先）→ ⏳等待進場（純均線）｜⏭已錯過 不顯示")
                 easy_df = easy_df.head(_top_n)
                 show_cols = [c for c in ["分數", "操作", "財務", "催化劑", "連掃天", "連買天", "外資累計(張)",
                                           "代號", "產業", "收盤價", "止損價", "觸發價",
@@ -2347,7 +2402,7 @@ with tabs[-4]:
                                           "距52週高%", "偵測型態", "訊號日期"]
                              if c in easy_df.columns]
                 disp = easy_df[show_cols].reset_index(drop=True)
-                disp["操作"] = disp["操作"].map({"可買": "✅ 可買（訊號確認）", "等待進場": "⏳ 等待進場"}).fillna(disp["操作"])
+                disp["操作"] = disp["操作"].map(_OP_LABEL).fillna(disp["操作"])
                 st.dataframe(disp, use_container_width=True, hide_index=True)
                 st.download_button(
                     "下載操作清單 CSV",

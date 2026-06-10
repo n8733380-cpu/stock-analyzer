@@ -627,6 +627,15 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         if revenue_yoy is None or revenue_yoy <= 0:
             action = "等待進場"
 
+    # 細分「等待進場」語意（同 stock_analyzer.py 邏輯）
+    if action == "等待進場" and consol_pat:
+        if broke_out:
+            action = "條件未足"
+        elif _trigger is not None and close > _trigger * 1.08:
+            action = "已錯過"
+        else:
+            action = "等突破"
+
     score   = calc_score(df, patterns, fast_col, slow_col, rs_val, revenue_yoy)
     high_52 = df["High"].tail(252).max() if len(df) >= 150 else df["High"].max()
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
@@ -750,7 +759,10 @@ def _build_table_html(df, header_color="#2c3e50"):
             "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "連掃天", "觸發價", "型態"]
     cols = [c for c in cols if c in df.columns]
     def _row_color(op):
-        return "#d4edda" if op == "可買" else "#fff3cd" if op == "等待進場" else "white"
+        if op == "可買":      return "#d4edda"   # 綠
+        if op == "條件未足":  return "#ffe0b2"   # 橘
+        if op in ("等突破", "等待進場"): return "#fff3cd"  # 黃
+        return "white"
     rows_html = ""
     for _, r in df.iterrows():
         bg    = _row_color(r.get("操作", ""))
@@ -879,9 +891,10 @@ def main():
     # 上市：依連買天→分數排序，TOP N
     filtered_tw = pd.DataFrame()
     if not result_tw.empty:
+        _SHOW_OPS = ["可買", "條件未足", "等突破", "等待進場"]
         filtered_tw = result_tw[
             (result_tw["分數"] >= MIN_SCORE) &
-            (result_tw["操作"].isin(["可買", "等待進場"]))
+            (result_tw["操作"].isin(_SHOW_OPS))
         ].sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N).copy()
         print(f"  上市符合（分數≥{MIN_SCORE}）：{len(filtered_tw)} 支")
 
@@ -890,7 +903,7 @@ def main():
     if not result_two.empty:
         filtered_otc = result_two[
             (result_two["分數"] >= MIN_SCORE_OTC) &
-            (result_two["操作"].isin(["可買", "等待進場"]))
+            (result_two["操作"].isin(_SHOW_OPS))
         ].sort_values("分數", ascending=False).head(TOP_N).copy()
         print(f"  上櫃符合（分數≥{MIN_SCORE_OTC}）：{len(filtered_otc)} 支")
 
