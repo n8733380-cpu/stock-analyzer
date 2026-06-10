@@ -31,3 +31,11 @@ jobs:
         env:
           GMAIL_APP_PW: ${{ secrets.GMAIL_APP_PW }}
         run: python daily_scan.py
+
+      - name: Save scan history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scan_history.json
+          git diff --cached --quiet || git commit -m "chore: update scan history [skip ci]"
+          git push
