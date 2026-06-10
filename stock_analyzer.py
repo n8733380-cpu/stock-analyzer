@@ -1944,12 +1944,13 @@ for tab, code in zip(tabs, stock_codes):
         else:
             action_q = "不看"
 
+        try:
+            _rev_yoy_q = fetch_monthly_revenue().get(code, None)
+        except Exception:
+            _rev_yoy_q = None
+
         _CYCLICAL_Q = {"建材營造業", "水泥工業", "汽車工業"}
         if action_q == "可買" and _sector_q in _CYCLICAL_Q:
-            try:
-                _rev_yoy_q = fetch_monthly_revenue().get(code, None)
-            except Exception:
-                _rev_yoy_q = None
             if _rev_yoy_q is None or _rev_yoy_q <= 0:
                 action_q = "等待進場"
 
@@ -1994,7 +1995,7 @@ for tab, code in zip(tabs, stock_codes):
         rsi_q   = round(float(latest["RSI14"]), 1) if "RSI14" in df.columns and pd.notna(latest.get("RSI14")) else None
         _bench_q = _fetch_benchmark(period)
         rs_q     = _calc_rs(df, _bench_q)
-        score_q  = calc_score(df, pats_q, fast_col, slow_col, rs_q)
+        score_q  = calc_score(df, pats_q, fast_col, slow_col, rs_q, _rev_yoy_q)
         rr_q    = round((target_q - close) / (close - stop_q), 2) if 0 < stop_q < close else None
 
         st.markdown("---")
