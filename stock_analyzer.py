@@ -733,6 +733,22 @@ def _detect_regime(df, n_states=3):
         return "無法判斷"
 
 
+def _get_market_regime(df):
+    """收盤 vs MA20 vs MA60 判斷大盤狀態：多頭 / 過渡期 / 空頭"""
+    if df is None or len(df) < 60:
+        return "資料不足"
+    c = df["Close"]
+    ma20 = float(c.rolling(20).mean().iloc[-1])
+    ma60 = float(c.rolling(60).mean().iloc[-1])
+    today = float(c.iloc[-1])
+    if today > ma20 and ma20 > ma60:
+        return "多頭"
+    elif today < ma20 and ma20 < ma60:
+        return "空頭"
+    else:
+        return "過渡期"
+
+
 @st.cache_data(ttl=3600)
 def _fetch_benchmark(period):
     """抓 0050.TW 作為大盤基準"""
@@ -2106,14 +2122,14 @@ for tab, code in zip(tabs, stock_codes):
                 st.metric(f"相對強度 vs 0050（近3月）", f"{rs_val:+.1f}%",
                           rs_label, delta_color=clr)
         with row_info[2]:
-            _regime = _detect_regime(bench_df)  # 用 0050 大盤資料，不是個股
+            _regime = _get_market_regime(bench_df)
             _REGIME_STYLE = {
-                "多頭": ("success", "多頭 — 趨勢順風"),
-                "橫盤": ("info",    "橫盤 — 謹慎操作"),
-                "空頭": ("error",   "空頭 ⚠️ 暫緩新進場"),
+                "多頭":   ("success", "多頭 — 趨勢順風"),
+                "過渡期": ("info",    "過渡期 — 謹慎操作"),
+                "空頭":   ("error",   "空頭 ⚠️ 暫緩新進場"),
             }
             _fn, _txt = _REGIME_STYLE.get(_regime, ("info", _regime))
-            getattr(st, _fn)(f"GMM 市場狀態：{_txt}")
+            getattr(st, _fn)(f"大盤狀態：{_txt}")
 
         # ── 進場策略 + 失效條件 ──────────────────────────────────────────────────
         _, _, fails = _build_strategy(
@@ -2253,17 +2269,17 @@ with tabs[-4]:
                                     use_atr_stop=use_atr_stop, atr_mult=atr_mult,
                                     revenue_dict=_rev_dict)
             pb.empty()
-            # ── GMM 大盤狀態 banner ──────────────────────────────────────────
+            # ── 大盤狀態 banner ──────────────────────────────────────────
             if _bench is not None and not _bench.empty:
-                _scan_regime = _detect_regime(_bench)
+                _scan_regime = _get_market_regime(_bench)
                 if _scan_regime == "空頭":
-                    st.error("大盤 GMM：空頭 — 可買訊號可信度降低，建議觀望或縮減部位")
+                    st.error("大盤：空頭 — 可買訊號可信度降低，建議觀望或縮減部位")
                     if "操作" in result_df.columns:
                         result_df.loc[result_df["操作"] == "可買", "操作"] = "條件未足"
-                elif _scan_regime == "橫盤":
-                    st.warning("大盤 GMM：橫盤 — 個股勝率下降，謹慎操作")
+                elif _scan_regime == "過渡期":
+                    st.warning("大盤：過渡期 — 個股勝率下降，謹慎操作")
                 else:
-                    st.success("大盤 GMM：多頭 — 趨勢順風")
+                    st.success("大盤：多頭 — 趨勢順風")
             # RS vs 產業（方案二：同類股掃描結果中位數）
             if "產業" in result_df.columns and "3M%" in result_df.columns:
                 def _pct_float(s):

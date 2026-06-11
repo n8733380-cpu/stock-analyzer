@@ -502,9 +502,8 @@ def calc_score(df, patterns, fast_col, slow_col, rs_val=None, revenue_yoy=None):
     if pd.notna(vol_avg) and float(vol_avg) > 0:
         vol_ratio = float(latest["Volume"]) / float(vol_avg)
         if vol_ratio >= 2.0:   score += 20
-        elif vol_ratio >= 1.5: score += 14
-        elif vol_ratio >= 1.0: score += 7
-        elif vol_ratio >= 0.7: score += 2
+        elif vol_ratio >= 1.5: score += 8
+        elif vol_ratio >= 1.0: score += 3
     pos_pats = [p for p in patterns if "頂背離" not in p]
     PAT_W = {"VCP": 12, "杯柄": 10, "雙底": 9, "平台底": 7, "OBV底背離": 8, "RSI底背離": 5}
     score += min(20, sum(w for k, w in PAT_W.items() if any(k in p for p in pos_pats)))
@@ -578,9 +577,22 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     consol_pat = [p for p in patterns if any(k in p for k in ["VCP", "平台底", "杯柄", "雙底"])]
     _r1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-21]) - 1) * 100 if len(df) > 21 else 0
     _r3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-63]) - 1) * 100 if len(df) > 63 else 0
-    is_extended = (_r1m > 25 and not consol_pat) or (_r3m > 60 and not consol_pat)
     _trigger = _extract_trigger_price(patterns)
-    broke_out = (_trigger is not None and _trigger * 0.98 <= close <= _trigger * 1.08)
+    _vol_ser = df["Volume"] / (df["Volume"].rolling(20).mean() + 1e-9)
+    _strong_up_mask = (_vol_ser >= 2.0) & (df["Close"] > df["Close"].shift(1).fillna(df["Close"]))
+    _big_vol_days_idx = df.index[_strong_up_mask]
+    _days_since_big_vol = int((df.index[-1] - _big_vol_days_idx[-1]).days) if len(_big_vol_days_idx) > 0 else 999
+    _since_trigger_gain = (close / _trigger - 1) * 100 if _trigger is not None else 0
+    is_extended = (
+        (_r1m > 25 and not consol_pat) or
+        (_r3m > 60 and not consol_pat) or
+        (_days_since_big_vol > 3 and _since_trigger_gain > 5)
+    )
+    broke_out = (
+        _trigger is not None and
+        _trigger * 0.98 <= close <= _trigger * 1.08 and
+        _days_since_big_vol <= 3
+    )
 
     if top_divs:
         action = "不看"
@@ -594,6 +606,15 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         action = "等待進場"
     else:
         action = "不看"
+    # 盯盤候補：型態完整 + 距觸發價 ≤3% + 量縮 + 均線即將交叉
+    if action == "不看" and not top_divs and not is_extended and consol_pat and _trigger is not None:
+        _dist_to_trigger = (_trigger - close) / _trigger * 100
+        _vol5_avg  = float(df["Volume"].tail(5).mean())
+        _vol20_avg = float(df["Volume"].tail(20).mean())
+        _vol_contracting = _vol5_avg < _vol20_avg * 0.85
+        _gap_ratio = abs(float(latest[fast_col]) - float(latest[slow_col])) / max(float(latest[slow_col]), 1e-9)
+        if 0 <= _dist_to_trigger <= 3 and _vol_contracting and _gap_ratio < 0.02:
+            action = "盯盤候補"
     rs_val  = _calc_rs(df, bench_df)
     rsi_cur = float(df["RSI14"].iloc[-1]) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else 50
     if rs_val is not None and rs_val < -15:
@@ -616,11 +637,14 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     if action == "可買":
         _rsi_5d_min = float(df["RSI14"].tail(5).min()) if "RSI14" in df.columns else 50
         _aux = 0
-        if _vol_ratio >= 1.5:                                    _aux += 1
+        if _vol_ratio >= 2.0:                                    _aux += 1
         if consol_pat:                                           _aux += 1
         if _rsi_5d_min <= 40 and rsi_cur > 40:                  _aux += 1
         if _aux < 1:
             action = "等待進場"
+    # 量硬性門檻：可買必須量 >= 2x，否則降為等待進場（讓後續細分為條件未足/等突破）
+    if action == "可買" and _vol_ratio < 2.0:
+        action = "等待進場"
 
     _CYCLICAL = {"建材營造業", "水泥工業", "汽車工業"}
     if action == "可買" and sector in _CYCLICAL:
@@ -641,7 +665,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     dist_52h = round((close / high_52 - 1) * 100, 1) if high_52 > 0 else None
     rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
     r1m_val  = round(float(df["R1M"].iloc[-1]), 1) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else None
-    trigger  = _extract_trigger_price(patterns)
+    trigger = _trigger
     _stop   = round(trigger * 0.98, 1) if trigger is not None else None
     _target = round(trigger + (trigger - _stop) * 2, 1) if trigger is not None else None
     return {
@@ -772,7 +796,7 @@ def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
         COL_WIDTHS  = [12, 8, 8, 12, 6, 10, 10, 10, 10, 10, 12, 28, 8, 10, 12]
         HDR_FILL = PatternFill("solid", fgColor="1F4E79")
         HDR_FONT = Font(color="FFFFFF", bold=True)
-        OP_COLOR = {"可買": "C6EFCE", "條件未足": "FFEB9C", "等突破": "DDEBF7", "等待進場": "F2F2F2"}
+        OP_COLOR = {"可買": "C6EFCE", "條件未足": "FFEB9C", "等突破": "DDEBF7", "等待進場": "F2F2F2", "盯盤候補": "E8D5F5"}
         RES_COLOR = {"止損": "FFCCCC", "止盈": "C6EFCE", "進行中": "FFFFFF"}
 
         if os.path.exists(TRADE_LOG_FILE):
@@ -884,7 +908,7 @@ def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
 
 # ── 排序輔助 ──────────────────────────────────────────────────────────────────
 def _sort_ops(df):
-    _RANK = {"可買": 0, "條件未足": 1, "等突破": 2, "等待進場": 3}
+    _RANK = {"可買": 0, "條件未足": 1, "等突破": 2, "盯盤候補": 3, "等待進場": 4}
     def _tdist(row):
         try:
             tv = float(str(row.get("觸發價", "0")))
@@ -905,19 +929,26 @@ def _sort_ops(df):
 
 
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
-def _build_action_html(df_tw, df_otc):
-    """email 最上方的今日行動區塊：今日掛單（等突破）+ 今日可買"""
-    def _fmt_row(row, action_label, entry_label):
+def _build_action_html(df_tw, df_otc, regime="unknown"):
+    """email 最上方的今日行動區塊：盯盤候補 + 今日掛單（等突破）+ 今日可買"""
+    _REGIME_LABEL = {
+        "bull":    ("<span style='color:#27ae60'>多頭</span>", "#d4edda"),
+        "caution": ("<span style='color:#e67e22'>過渡期</span>", "#fff3cd"),
+        "bear":    ("<span style='color:#c0392b'>空頭 — 今日不建議進場</span>", "#f8d7da"),
+        "unknown": ("<span style='color:#888'>未知</span>", "#f8f9fa"),
+    }
+    regime_text, regime_bg = _REGIME_LABEL.get(regime, _REGIME_LABEL["unknown"])
+
+    def _fmt_row(row, action_label, entry_label, bg_color):
         code    = row.get("代號", "")
         trigger = row.get("觸發價", "—")
         stop    = row.get("停損價", "")
         target  = row.get("目標價", "")
         close   = row.get("收盤價", "")
-        # 進場價：等突破用觸發價，可買用收盤價~觸發價區間
         try:
             tv = float(str(trigger))
             cv = float(close)
-            if action_label == "掛單":
+            if action_label in ("掛單", "候補"):
                 entry_str = f"{tv:.1f}"
             else:
                 entry_str = f"{cv:.1f}~{tv*1.03:.1f}" if cv < tv else f"{cv:.1f}"
@@ -925,9 +956,8 @@ def _build_action_html(df_tw, df_otc):
             entry_str = str(trigger)
         stop_str   = f"{float(stop):.1f}"   if stop   not in ("", None) else "—"
         target_str = f"{float(target):.1f}" if target not in ("", None) else "—"
-        bg = "#e8f5e9" if action_label == "可買" else "#fff8e1"
         return (
-            f"<tr style='background:{bg}'>"
+            f"<tr style='background:{bg_color}'>"
             f"<td style='padding:8px 12px;font-size:15px;font-weight:bold'>{code}</td>"
             f"<td style='padding:8px 12px;color:#555'>{entry_label} {entry_str}</td>"
             f"<td style='padding:8px 12px;color:#c0392b'>停損 {stop_str}</td>"
@@ -938,48 +968,78 @@ def _build_action_html(df_tw, df_otc):
     all_df = pd.concat([df for df in [df_tw, df_otc] if df is not None and not df.empty], ignore_index=True) \
              if any(df is not None and not df.empty for df in [df_tw, df_otc]) else pd.DataFrame()
 
-    if all_df.empty:
-        return "<div style='background:#fff3cd;padding:16px;border-radius:6px;margin-bottom:20px'>" \
-               "<b>今日無進場訊號，建議觀望。</b></div>"
-
-    # 只取有觸發價的股票
     def _has_trigger(row):
         t = row.get("觸發價", "—")
         try: float(str(t)); return True
         except: return False
 
-    buyable   = all_df[(all_df["操作"] == "可買") & all_df.apply(_has_trigger, axis=1)]
-    pending   = all_df[(all_df["操作"] == "等突破") & all_df.apply(_has_trigger, axis=1)]
+    regime_banner = (
+        f"<p style='margin:0 0 12px 0;font-size:14px'>"
+        f"大盤狀態：{regime_text}</p>"
+    )
+
+    if all_df.empty:
+        return (
+            f"<div style='background:{regime_bg};border:2px solid #dee2e6;border-radius:8px;"
+            f"padding:16px 20px;margin-bottom:24px'>"
+            f"<h2 style='margin:0 0 8px 0;color:#2c3e50'>今日行動</h2>"
+            f"{regime_banner}"
+            f"<b>今日無進場訊號，建議觀望。</b></div>"
+        )
+
+    watching  = all_df[(all_df["操作"] == "盯盤候補") & all_df.apply(_has_trigger, axis=1)]
+    pending   = all_df[(all_df["操作"] == "等突破")   & all_df.apply(_has_trigger, axis=1)]
+    buyable   = all_df[(all_df["操作"] == "可買")     & all_df.apply(_has_trigger, axis=1)]
 
     sections = []
 
-    if not pending.empty:
-        rows_html = "".join(_fmt_row(r, "掛單", "限買") for _, r in pending.iterrows())
+    if not watching.empty:
+        rows_html = "".join(_fmt_row(r, "候補", "觸發", "#f3e5f5") for _, r in watching.iterrows())
         sections.append(
-            f"<h3 style='color:#e67e22;margin:0 0 6px 0'>今日掛單（等突破）</h3>"
+            f"<h3 style='color:#8e44ad;margin:0 0 6px 0'>盯盤候補（快突破了）</h3>"
+            f"<p style='color:#888;font-size:12px;margin:0 0 8px 0'>"
+            f"距觸發價 ≤3%、量縮蓄力，可提前在觸發價掛限買單等突破</p>"
+            f"<table style='border-collapse:collapse;width:100%'>{rows_html}</table>"
+        )
+
+    if not pending.empty:
+        rows_html = "".join(_fmt_row(r, "掛單", "限買", "#fff8e1") for _, r in pending.iterrows())
+        sections.append(
+            f"<h3 style='color:#e67e22;margin:16px 0 6px 0'>今日掛單（等突破）</h3>"
             f"<p style='color:#888;font-size:12px;margin:0 0 8px 0'>"
             f"在觸發價掛限買單，突破自動成交，不需要盯盤</p>"
             f"<table style='border-collapse:collapse;width:100%'>{rows_html}</table>"
         )
 
-    if not buyable.empty:
-        rows_html = "".join(_fmt_row(r, "可買", "進場") for _, r in buyable.iterrows())
+    if not buyable.empty and regime != "bear":
+        rows_html = "".join(_fmt_row(r, "可買", "進場", "#e8f5e9") for _, r in buyable.iterrows())
         sections.append(
             f"<h3 style='color:#27ae60;margin:16px 0 6px 0'>今日可買（已突破）</h3>"
             f"<p style='color:#888;font-size:12px;margin:0 0 8px 0'>"
-            f"已確認突破，今日收盤前可直接市價或限價進場</p>"
+            f"量 ≥ 2x 確認突破，今日收盤前可直接進場</p>"
             f"<table style='border-collapse:collapse;width:100%'>{rows_html}</table>"
+        )
+    elif not buyable.empty and regime == "bear":
+        sections.append(
+            f"<p style='color:#c0392b;margin:12px 0 0 0'>"
+            f"大盤空頭排列，{len(buyable)} 支可買訊號今日暫停，等大盤回到多頭再進場。</p>"
         )
 
     if not sections:
-        return "<div style='background:#fff3cd;padding:16px;border-radius:6px;margin-bottom:20px'>" \
-               "<b>今日訊號無觸發價，無法提供進場指令，請參考下方明細。</b></div>"
+        return (
+            f"<div style='background:{regime_bg};border:2px solid #dee2e6;border-radius:8px;"
+            f"padding:16px 20px;margin-bottom:24px'>"
+            f"<h2 style='margin:0 0 8px 0;color:#2c3e50'>今日行動</h2>"
+            f"{regime_banner}"
+            f"<b>今日訊號無觸發價，無法提供進場指令，請參考下方明細。</b></div>"
+        )
 
     inner = "".join(sections)
     return (
-        f"<div style='background:#f8f9fa;border:2px solid #dee2e6;border-radius:8px;"
+        f"<div style='background:{regime_bg};border:2px solid #dee2e6;border-radius:8px;"
         f"padding:16px 20px;margin-bottom:24px'>"
-        f"<h2 style='margin:0 0 12px 0;color:#2c3e50'>今日行動</h2>"
+        f"<h2 style='margin:0 0 8px 0;color:#2c3e50'>今日行動</h2>"
+        f"{regime_banner}"
         f"{inner}"
         f"</div>"
     )
@@ -992,6 +1052,7 @@ def _build_table_html(df, header_color="#2c3e50"):
         if op == "可買":      return "#d4edda"   # 綠
         if op == "條件未足":  return "#ffe0b2"   # 橘
         if op in ("等突破", "等待進場"): return "#fff3cd"  # 黃
+        if op == "盯盤候補":  return "#e8d5f5"   # 淡紫
         return "white"
     rows_html = ""
     for _, r in df.iterrows():
@@ -1008,7 +1069,7 @@ def _build_table_html(df, header_color="#2c3e50"):
 </table>"""
 
 
-def send_email(df_tw, df_otc, total_scanned, mops_news=None):
+def send_email(df_tw, df_otc, total_scanned, mops_news=None, regime="unknown"):
     _days = ["一", "二", "三", "四", "五", "六", "日"]
     today  = datetime.now().strftime("%Y-%m-%d") + f"（週{_days[datetime.now().weekday()]}）"
     n_tw   = len(df_tw)
@@ -1051,7 +1112,7 @@ def send_email(df_tw, df_otc, total_scanned, mops_news=None):
 <tbody>{mops_rows}</tbody>
 </table>"""
 
-    action_html = _build_action_html(df_tw, df_otc)
+    action_html = _build_action_html(df_tw, df_otc, regime=regime)
 
     html = f"""<html><body style='font-family:Arial,sans-serif;padding:20px'>
 <h2 style='color:#2c3e50'>台股每日掃描 — {today}</h2>
@@ -1076,6 +1137,34 @@ def send_email(df_tw, df_otc, total_scanned, mops_news=None):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_APP_PW)
         s.sendmail(GMAIL_USER, TO_EMAIL, msg.as_string())
+
+# ── 大盤狀態 ─────────────────────────────────────────────────────────────────
+def _get_market_regime(bench_df):
+    """bull / caution / bear / unknown"""
+    if bench_df is None or len(bench_df) < 60:
+        return "unknown"
+    c = bench_df["Close"]
+    ma20 = float(c.rolling(20).mean().iloc[-1])
+    ma60 = float(c.rolling(60).mean().iloc[-1])
+    today_close = float(c.iloc[-1])
+    if today_close > ma20 and ma20 > ma60:
+        return "bull"
+    elif today_close < ma20 and ma20 < ma60:
+        return "bear"
+    else:
+        return "caution"
+
+# ── 失效計數過濾 ──────────────────────────────────────────────────────────────
+_STALE_DAYS = {"等突破": 5, "條件未足": 5, "可買": 3, "盯盤候補": 7}
+
+def _apply_staleness(df_):
+    if df_.empty or "連掃天" not in df_.columns:
+        return df_
+    def _keep(row):
+        op = row.get("操作", "")
+        streak = int(row.get("連掃天", 0))
+        return streak < _STALE_DAYS.get(op, 999)
+    return df_[df_.apply(_keep, axis=1)].copy()
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 def main():
@@ -1121,32 +1210,45 @@ def main():
         result_two["連買天"]       = 0
         result_two["外資累計(張)"] = 0
 
+    # 大盤狀態
+    regime = _get_market_regime(bench_df)
+    _REGIME_MSG = {"bull": "多頭", "caution": "過渡期", "bear": "空頭", "unknown": "未知"}
+    print(f"  大盤狀態：{_REGIME_MSG.get(regime, regime)}")
+
     # 上市：依連買天→分數排序，TOP N
+    _SHOW_OPS = ["可買", "條件未足", "等突破", "盯盤候補", "等待進場"]
     filtered_tw = pd.DataFrame()
     if not result_tw.empty:
-        _SHOW_OPS = ["可買", "條件未足", "等突破", "等待進場"]
+        _score_gate = MIN_SCORE + 5 if regime == "caution" else MIN_SCORE
         filtered_tw = result_tw[
-            (result_tw["分數"] >= MIN_SCORE) &
+            (result_tw["分數"] >= _score_gate) &
             (result_tw["操作"].isin(_SHOW_OPS))
         ]
         filtered_tw = _sort_ops(filtered_tw).head(TOP_N).copy()
-        print(f"  上市符合（分數≥{MIN_SCORE}）：{len(filtered_tw)} 支")
+        print(f"  上市符合（分數>={_score_gate}）：{len(filtered_tw)} 支")
 
     # 上櫃：獨立門檻，依分數排序，TOP N
     filtered_otc = pd.DataFrame()
     if not result_two.empty:
+        _score_gate_otc = MIN_SCORE_OTC + 5 if regime == "caution" else MIN_SCORE_OTC
         filtered_otc = result_two[
-            (result_two["分數"] >= MIN_SCORE_OTC) &
+            (result_two["分數"] >= _score_gate_otc) &
             (result_two["操作"].isin(_SHOW_OPS))
         ]
         filtered_otc = _sort_ops(filtered_otc).head(TOP_N).copy()
-        print(f"  上櫃符合（分數≥{MIN_SCORE_OTC}）：{len(filtered_otc)} 支")
+        print(f"  上櫃符合（分數>={_score_gate_otc}）：{len(filtered_otc)} 支")
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     hist = _load_scan_history()
     for df_ in [filtered_tw, filtered_otc]:
         if not df_.empty:
             df_["連掃天"] = df_["代號"].apply(lambda c: _count_streak(c, hist, today_str))
+
+    # 失效計數過濾（連掃超過門檻天數移出）
+    filtered_tw  = _apply_staleness(filtered_tw)
+    filtered_otc = _apply_staleness(filtered_otc)
+    print(f"  失效過濾後：上市 {len(filtered_tw)} 支 ／ 上櫃 {len(filtered_otc)} 支")
+
     all_codes = (filtered_tw["代號"].tolist() if not filtered_tw.empty else []) + \
                 (filtered_otc["代號"].tolist() if not filtered_otc.empty else [])
     _save_scan_history(today_str, all_codes)
@@ -1157,7 +1259,7 @@ def main():
 
     print("寄送郵件...")
     total_scanned = len(codes_tw) + len(codes_two)
-    send_email(filtered_tw, filtered_otc, total_scanned, mops_news=mops_news)
+    send_email(filtered_tw, filtered_otc, total_scanned, mops_news=mops_news, regime=regime)
 
     print("寫入每日訊號紀錄...")
     _append_signals_to_excel(filtered_tw, filtered_otc, today_str)
