@@ -2390,7 +2390,7 @@ with tabs[-4]:
                         else:
                             entry_str = f"{cv:.1f}~{tv*1.03:.1f}" if cv and cv < tv else f"{tv:.1f}"
                         rows.append(
-                            f"<div style='display:inline-block;background:{bg};"
+                            f"<div style='display:inline-block;background:{bg};color:#1a1a1a;"
                             f"border-radius:8px;padding:10px 16px;margin:4px;min-width:220px'>"
                             f"<div style='font-size:18px;font-weight:bold'>{r['代號']}</div>"
                             f"<div style='font-size:13px;color:#555'>{entry_label} <b>{entry_str}</b></div>"
