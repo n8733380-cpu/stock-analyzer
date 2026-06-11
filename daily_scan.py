@@ -642,6 +642,8 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
     rsi_now  = round(float(df["RSI14"].iloc[-1]), 1) if "RSI14" in df.columns and pd.notna(df["RSI14"].iloc[-1]) else None
     r1m_val  = round(float(df["R1M"].iloc[-1]), 1) if "R1M" in df.columns and pd.notna(df["R1M"].iloc[-1]) else None
     trigger  = _extract_trigger_price(patterns)
+    _stop   = round(trigger * 0.98, 1) if trigger is not None else None
+    _target = round(trigger + (trigger - _stop) * 2, 1) if trigger is not None else None
     return {
         "分數": score,
         "代號": code,
@@ -659,6 +661,8 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         "月營收YoY": f"{revenue_yoy:+.0f}%" if revenue_yoy is not None else "—",
         "觸發價": f"{trigger:.1f}" if trigger is not None else "—",
         "量/20MA": round(_vol_ratio, 2),
+        "停損價": _stop,
+        "目標價": _target,
     }
 
 # ── MOPS 重大公告監控 ─────────────────────────────────────────────────────────
@@ -762,13 +766,14 @@ def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
         from openpyxl.styles import PatternFill, Font, Alignment
         from openpyxl.utils import get_column_letter
 
-        SIGNAL_COLS  = ["日期", "市場", "代號", "操作", "分數", "收盤價", "觸發價", "量/20MA", "月營收YoY", "型態", "連掃天"]
-        TRADE_COLS   = ["代號", "股名", "進場日", "進場價", "張數", "停損價", "目標價", "出場日", "出場價", "出場原因", "損益(元)", "損益(%)", "備注"]
-        COL_WIDTHS_T = [8, 12, 12, 10, 6, 10, 10, 12, 10, 14, 12, 10, 20]
-        COL_WIDTHS_S = [12, 8, 8, 12, 6, 10, 10, 10, 12, 30, 10]
+        # 欄位定義（含停損、目標、結果）
+        SIGNAL_COLS = ["日期", "市場", "代號", "操作", "分數", "收盤價",
+                       "觸發價", "停損價", "目標價", "量/20MA", "月營收YoY", "型態", "連掃天", "結果", "結果日"]
+        COL_WIDTHS  = [12, 8, 8, 12, 6, 10, 10, 10, 10, 10, 12, 28, 8, 10, 12]
         HDR_FILL = PatternFill("solid", fgColor="1F4E79")
         HDR_FONT = Font(color="FFFFFF", bold=True)
         OP_COLOR = {"可買": "C6EFCE", "條件未足": "FFEB9C", "等突破": "DDEBF7", "等待進場": "F2F2F2"}
+        RES_COLOR = {"止損": "FFCCCC", "止盈": "C6EFCE", "進行中": "FFFFFF"}
 
         if os.path.exists(TRADE_LOG_FILE):
             wb = openpyxl.load_workbook(TRADE_LOG_FILE)
@@ -777,20 +782,9 @@ def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
             if "Sheet" in wb.sheetnames:
                 del wb["Sheet"]
 
-        # 確保「交易紀錄」工作表存在
-        if "交易紀錄" not in wb.sheetnames:
-            ws_t = wb.create_sheet("交易紀錄", 0)
-            for i, (h, w) in enumerate(zip(TRADE_COLS, COL_WIDTHS_T), 1):
-                c = ws_t.cell(row=1, column=i, value=h)
-                c.fill, c.font = HDR_FILL, HDR_FONT
-                c.alignment = Alignment(horizontal="center")
-                ws_t.column_dimensions[get_column_letter(i)].width = w
-            ws_t.freeze_panes = "A2"
-
-        # 確保「每日訊號」工作表存在
         if "每日訊號" not in wb.sheetnames:
             ws_s = wb.create_sheet("每日訊號")
-            for i, (h, w) in enumerate(zip(SIGNAL_COLS, COL_WIDTHS_S), 1):
+            for i, (h, w) in enumerate(zip(SIGNAL_COLS, COL_WIDTHS), 1):
                 c = ws_s.cell(row=1, column=i, value=h)
                 c.fill, c.font = HDR_FILL, HDR_FONT
                 c.alignment = Alignment(horizontal="center")
@@ -799,43 +793,92 @@ def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
         else:
             ws_s = wb["每日訊號"]
 
-        # 避免重複寫入同一天
-        existing = {str(ws_s.cell(r, 1).value) for r in range(2, ws_s.max_row + 1)}
-        if today_str in existing:
-            print(f"  每日訊號：{today_str} 已存在，跳過")
-            wb.save(TRADE_LOG_FILE)
-            return
-
-        next_row = ws_s.max_row + 1
-        for market, df in [("上市", filtered_tw), ("上櫃", filtered_otc)]:
-            if df is None or df.empty:
+        # ── 自動更新舊紀錄結果（回頭追蹤）────────────────────────────────
+        # 欄位索引（1-based）
+        COL = {h: i for i, h in enumerate(SIGNAL_COLS, 1)}
+        price_cache = {}
+        for row_idx in range(2, ws_s.max_row + 1):
+            result_cell = ws_s.cell(row_idx, COL["結果"])
+            if result_cell.value and result_cell.value != "進行中":
+                continue  # 已有結果，跳過
+            code     = ws_s.cell(row_idx, COL["代號"]).value
+            stop_v   = ws_s.cell(row_idx, COL["停損價"]).value
+            target_v = ws_s.cell(row_idx, COL["目標價"]).value
+            sig_date = ws_s.cell(row_idx, COL["日期"]).value
+            if not code or stop_v is None or target_v is None:
                 continue
-            for _, row in df.iterrows():
-                op   = row.get("操作", "")
-                fill = PatternFill("solid", fgColor=OP_COLOR.get(op, "FFFFFF"))
-                vr   = row.get("量/20MA", "")
-                vr_s = f"{vr:.2f}x" if isinstance(vr, float) else str(vr)
-                vals = [
-                    today_str, market,
-                    row.get("代號", ""),
-                    op,
-                    row.get("分數", ""),
-                    row.get("收盤價", ""),
-                    row.get("觸發價", ""),
-                    vr_s,
-                    row.get("月營收YoY", ""),
-                    row.get("型態", ""),
-                    row.get("連掃天", ""),
-                ]
-                for i, val in enumerate(vals, 1):
-                    c = ws_s.cell(row=next_row, column=i, value=val)
-                    c.fill = fill
-                    c.alignment = Alignment(horizontal="center")
-                next_row += 1
+            try:
+                stop_f, target_f = float(stop_v), float(target_v)
+                ticker = f"{code}.TW" if ws_s.cell(row_idx, COL["市場"]).value == "上市" else f"{code}.TWO"
+                if ticker not in price_cache:
+                    _df = yf.Ticker(ticker).history(period="20d")
+                    price_cache[ticker] = _df[["High", "Low", "Close"]].copy() if not _df.empty else pd.DataFrame()
+                _ph = price_cache[ticker]
+                if _ph.empty:
+                    continue
+                sig_dt = pd.Timestamp(str(sig_date)).tz_localize(None) if sig_date else None
+                if sig_dt is not None:
+                    _ph = _ph[_ph.index.tz_localize(None) > sig_dt]
+                if _ph.empty:
+                    result_cell.value = "進行中"
+                    continue
+                hit_stop   = (_ph["Low"]  <= stop_f).any()
+                hit_target = (_ph["High"] >= target_f).any()
+                if hit_stop and hit_target:
+                    # 看哪個先發生
+                    stop_day   = _ph[_ph["Low"]  <= stop_f].index[0]
+                    target_day = _ph[_ph["High"] >= target_f].index[0]
+                    result, rdate = ("止損", stop_day) if stop_day <= target_day else ("止盈", target_day)
+                elif hit_stop:
+                    result, rdate = "止損", _ph[_ph["Low"] <= stop_f].index[0]
+                elif hit_target:
+                    result, rdate = "止盈", _ph[_ph["High"] >= target_f].index[0]
+                else:
+                    result, rdate = "進行中", None
+                result_cell.value = result
+                result_cell.fill  = PatternFill("solid", fgColor=RES_COLOR.get(result, "FFFFFF"))
+                if rdate is not None:
+                    ws_s.cell(row_idx, COL["結果日"]).value = rdate.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # ── 寫入今日新訊號 ──────────────────────────────────────────────────
+        existing = {str(ws_s.cell(r, 1).value) for r in range(2, ws_s.max_row + 1)}
+        if today_str not in existing:
+            next_row = ws_s.max_row + 1
+            for market, df in [("上市", filtered_tw), ("上櫃", filtered_otc)]:
+                if df is None or df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    op   = row.get("操作", "")
+                    fill = PatternFill("solid", fgColor=OP_COLOR.get(op, "FFFFFF"))
+                    vr   = row.get("量/20MA", "")
+                    vals = [
+                        today_str, market,
+                        row.get("代號", ""),
+                        op,
+                        row.get("分數", ""),
+                        row.get("收盤價", ""),
+                        row.get("觸發價", ""),
+                        row.get("停損價", ""),
+                        row.get("目標價", ""),
+                        f"{vr:.2f}x" if isinstance(vr, float) else str(vr),
+                        row.get("月營收YoY", ""),
+                        row.get("型態", ""),
+                        row.get("連掃天", ""),
+                        "進行中", "",
+                    ]
+                    for i, val in enumerate(vals, 1):
+                        c = ws_s.cell(row=next_row, column=i, value=val)
+                        c.fill = fill
+                        c.alignment = Alignment(horizontal="center")
+                    next_row += 1
+            print(f"  今日新訊號已寫入（{next_row - 1} 列）")
+        else:
+            print(f"  今日訊號已存在，跳過寫入，僅更新結果")
 
         wb.save(TRADE_LOG_FILE)
-        count = next_row - ws_s.max_row - 1
-        print(f"  每日訊號已寫入：{next_row - 1} 列（{TRADE_LOG_FILE}）")
+        print(f"  交易紀錄已儲存：{TRADE_LOG_FILE}")
     except Exception as e:
         print(f"  每日訊號寫入失敗：{e}")
 
