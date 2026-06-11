@@ -686,52 +686,6 @@ def run_pattern_backtest(df, fast_col, slow_col, fast_ma, slow_ma,
                         stop_pct=stop_pct)
 
 
-@st.cache_data(ttl=1800)
-def _detect_regime(df, n_states=3):
-    """
-    用 GaussianMixture 偵測股票自身的市場狀態：多頭 / 橫盤 / 空頭
-    特徵：20日均報酬、20日波動率、成交量比
-    不依賴 hmmlearn，sklearn 已內建。
-    """
-    try:
-        import warnings
-        warnings.filterwarnings("ignore", category=UserWarning)
-        from sklearn.mixture import GaussianMixture
-        from sklearn.preprocessing import StandardScaler
-
-        if len(df) < 60:
-            return "資料不足"
-
-        close  = df["Close"].values.astype(float)
-        volume = df["Volume"].values.astype(float)
-
-        log_ret = np.log(close[1:] / close[:-1])
-        ret_20  = pd.Series(log_ret).rolling(20).mean().values
-        vol_20  = pd.Series(log_ret).rolling(20).std().values * np.sqrt(252)
-        vol_idx = volume[1:]
-        vr      = vol_idx / (pd.Series(vol_idx).rolling(20).mean().values + 1e-9)
-
-        X = np.column_stack([ret_20, vol_20, vr])
-        mask = ~np.isnan(X).any(axis=1)
-        X_clean = X[mask]
-
-        if len(X_clean) < 30:
-            return "資料不足"
-
-        X_s    = StandardScaler().fit_transform(X_clean)
-        states = GaussianMixture(n_components=n_states, random_state=42,
-                                  max_iter=300).fit_predict(X_s)
-
-        state_ret = {s: float(X_clean[states == s, 0].mean()) for s in range(n_states)}
-        ordered   = sorted(state_ret, key=lambda s: state_ret[s])
-        label_map = {ordered[0]: "空頭", ordered[-1]: "多頭"}
-        if n_states == 3:
-            label_map[ordered[1]] = "橫盤"
-
-        return label_map.get(int(states[-1]), "未知")
-    except Exception:
-        return "無法判斷"
-
 
 def _get_market_regime(df):
     """收盤 vs MA20 vs MA60 判斷大盤狀態：多頭 / 過渡期 / 空頭"""
