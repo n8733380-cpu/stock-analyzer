@@ -1850,7 +1850,7 @@ if not stock_codes:
     st.warning("請在左側輸入至少一支股票代號")
     st.stop()
 
-tabs = st.tabs([f"  {code}  " for code in stock_codes] + ["  選股掃描  ", "  興櫃升板雷達  ", "  回測  ", "  模擬交易  "])
+tabs = st.tabs([f"  {code}  " for code in stock_codes] + ["  選股掃描  ", "  興櫃升板雷達  ", "  回測  ", "  模擬交易  ", "  行動紀錄  "])
 
 for tab, code in zip(tabs, stock_codes):
     with tab:
@@ -2144,7 +2144,7 @@ for tab, code in zip(tabs, stock_codes):
                 )
 
 # ── 選股掃描頁 ────────────────────────────────────────────────────────────────
-with tabs[-4]:
+with tabs[-5]:
     st.subheader("選股掃描")
 
     scan_mode = st.radio(
@@ -2223,6 +2223,7 @@ with tabs[-4]:
                                     use_atr_stop=use_atr_stop, atr_mult=atr_mult,
                                     revenue_dict=_rev_dict)
             pb.empty()
+            _scan_regime = "未知"
             # ── 大盤狀態 banner ──────────────────────────────────────────
             if _bench is not None and not _bench.empty:
                 _scan_regime = _get_market_regime(_bench)
@@ -2416,6 +2417,34 @@ with tabs[-4]:
                             st.markdown("".join(cards), unsafe_allow_html=True)
                     st.markdown("---")
 
+                # 儲存今日行動紀錄
+                _AH_PATH = os.path.join(os.path.dirname(__file__), "action_history.json")
+                try:
+                    with open(_AH_PATH, "r", encoding="utf-8") as _f:
+                        _ah = json.load(_f)
+                except Exception:
+                    _ah = {}
+                def _df_to_records(df):
+                    out = []
+                    for _, r in df.iterrows():
+                        tv = _try_float(r.get("觸發價"))
+                        sv = _try_float(r.get("止損價"))
+                        if tv is None:
+                            continue
+                        stop = sv if sv is not None else round(tv * 0.98, 1)
+                        target = round(tv + (tv - stop) * 2, 1)
+                        out.append({"代號": str(r["代號"]), "觸發價": tv, "止損價": stop, "目標": target})
+                    return out
+                from datetime import datetime as _dtnow2
+                _today_ah = _dtnow2.now().strftime("%Y-%m-%d")
+                _ah[_today_ah] = {
+                    "大盤": _scan_regime,
+                    "掛單": _df_to_records(_pending),
+                    "可買": _df_to_records(_buyable),
+                }
+                with open(_AH_PATH, "w", encoding="utf-8") as _f:
+                    json.dump(_ah, _f, ensure_ascii=False, indent=2)
+
                 _top_n = st.slider("顯示前幾名", 10, 50, 20, key="top_n_slider")
                 st.markdown(f"### 操作建議清單（前 {_top_n} 名）")
                 st.caption("✅可買 → ⚠️條件未足（在窗口）→ ⚡等突破（最近觸發優先）→ ⏳等待進場（純均線）｜⏭已錯過 不顯示")
@@ -2488,7 +2517,7 @@ with tabs[-4]:
         )
 
 # ── 興櫃升板雷達頁 ────────────────────────────────────────────────────────────
-with tabs[-3]:
+with tabs[-4]:
     st.subheader("興櫃升板雷達")
     st.caption("複製 6959 模式：從 MOPS 找正在申請升板的興櫃股")
 
@@ -2609,7 +2638,7 @@ with tabs[-3]:
     st.caption("資料來源：MOPS 公開資訊觀測站、TPEX 興櫃報價。僅供參考，不構成投資建議。")
 
 # ── 回測頁 ───────────────────────────────────────────────────────────────────
-with tabs[-2]:
+with tabs[-3]:
     st.subheader("策略回測")
 
     bt_c1, bt_c2, bt_c3, bt_c4 = st.columns([2, 2, 2, 1])
@@ -2762,7 +2791,7 @@ with tabs[-2]:
 
 
 # ── 模擬交易頁 ────────────────────────────────────────────────────────────────
-with tabs[-1]:
+with tabs[-2]:
     st.subheader("模擬交易")
     st.caption("記錄模擬持倉，追蹤即時損益。資料存於 D:\\私人\\股票分析\\paper_trades.json")
 
@@ -2931,3 +2960,55 @@ with tabs[-1]:
                     "備註":     p.get("note", ""),
                 })
             st.dataframe(pd.DataFrame(c_rows), use_container_width=True, hide_index=True)
+
+# ── 行動紀錄頁 ────────────────────────────────────────────────────────────────
+with tabs[-1]:
+    st.subheader("行動紀錄")
+    st.caption("每次執行選股掃描後自動儲存當天的今日行動（掛單 / 可買）")
+
+    _AH_PATH_R = os.path.join(os.path.dirname(__file__), "action_history.json")
+    try:
+        with open(_AH_PATH_R, "r", encoding="utf-8") as _f:
+            _ah_data = json.load(_f)
+    except Exception:
+        _ah_data = {}
+
+    if not _ah_data:
+        st.info("尚無紀錄。執行一次選股掃描後會自動儲存。")
+    else:
+        for _date in sorted(_ah_data.keys(), reverse=True):
+            _rec = _ah_data[_date]
+            _regime_disp = _rec.get("大盤", "未知")
+            _regime_color = {"多頭": "#1e4d2b", "過渡期": "#4d3d00", "空頭": "#4d0000"}.get(_regime_disp, "#333")
+            st.markdown(
+                f"<div style='font-size:18px;font-weight:bold;margin-top:18px'>{_date}"
+                f"<span style='font-size:13px;font-weight:normal;background:{_regime_color};"
+                f"color:#fff;border-radius:4px;padding:2px 8px;margin-left:10px'>"
+                f"大盤 {_regime_disp}</span></div>",
+                unsafe_allow_html=True,
+            )
+            _pending_r = _rec.get("掛單", [])
+            _buyable_r = _rec.get("可買", [])
+            if not _pending_r and not _buyable_r:
+                st.markdown("<span style='color:#888;font-size:13px'>當日無進場訊號</span>", unsafe_allow_html=True)
+            else:
+                def _hist_cards(items, bg, entry_label):
+                    parts = []
+                    for item in items:
+                        parts.append(
+                            f"<div style='display:inline-block;background:{bg};color:#1a1a1a;"
+                            f"border-radius:8px;padding:10px 16px;margin:4px;min-width:180px'>"
+                            f"<div style='font-size:16px;font-weight:bold'>{item['代號']}</div>"
+                            f"<div style='font-size:12px;color:#555'>{entry_label} <b>{item['觸發價']:.1f}</b></div>"
+                            f"<div style='font-size:12px;color:#c0392b'>停損 <b>{item['止損價']:.1f}</b></div>"
+                            f"<div style='font-size:12px;color:#27ae60'>目標 <b>{item['目標']:.1f}</b></div>"
+                            f"</div>"
+                        )
+                    return "".join(parts)
+                if _pending_r:
+                    st.markdown("**掛單（等突破）**")
+                    st.markdown(_hist_cards(_pending_r, "#fff8e1", "限買"), unsafe_allow_html=True)
+                if _buyable_r:
+                    st.markdown("**可買（已突破）**")
+                    st.markdown(_hist_cards(_buyable_r, "#e8f5e9", "進場"), unsafe_allow_html=True)
+            st.markdown("---")
