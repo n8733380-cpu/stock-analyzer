@@ -29,6 +29,10 @@ MIN_SCORE_OTC = 45   # 上櫃門檻（無 T86 法人資料，分數天花板較�
 TOP_N         = 10   # 各市場各取前 N
 SCAN_OTC      = True # 同時掃上櫃（.TWO）
 
+ACTION_SHEET_ID = "1fVpgRt9BG_tFrgWIRjji0u9rCV-TsjgCRB4Vfb54w3k"
+SECRETS_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".streamlit", "secrets.toml")
+
 # MOPS 重大公告監控關鍵字
 MOPS_KEYWORDS = [
     "資產處分", "出售土地", "出售廠房", "出售不動產",
@@ -784,6 +788,45 @@ def scan_stocks(codes, bench_df, sector_map, suffix=".TW", revenue_dict=None):
 
 TRADE_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "交易紀錄.xlsx")
 
+def _append_action_to_gsheet(filtered_tw, filtered_otc, today_str, time_str, regime_label):
+    """把當日掛單/可買 append 到 Google Sheets 行動紀錄"""
+    try:
+        import gspread, toml
+        from google.oauth2.service_account import Credentials
+        secrets = toml.load(SECRETS_PATH)
+        creds = Credentials.from_service_account_info(
+            dict(secrets["gcp_service_account"]),
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ws = gspread.authorize(creds).open_by_key(ACTION_SHEET_ID).worksheet("行動紀錄")
+
+        rows = []
+        for df, action_type in [(filtered_tw, None), (filtered_otc, None)]:
+            if df.empty:
+                continue
+            pending = df[df["操作"] == "等突破"]
+            buyable = df[df["操作"] == "可買"]
+            for sub_df, atype in [(pending, "掛單"), (buyable, "可買")]:
+                for _, r in sub_df.iterrows():
+                    tv = r.get("觸發價")
+                    sv = r.get("止損價")
+                    try:
+                        tv = float(str(tv))
+                        sv = float(str(sv)) if sv not in (None, "", "—") else round(tv * 0.98, 1)
+                    except (ValueError, TypeError):
+                        continue
+                    target = round(tv + (tv - sv) * 2, 1)
+                    rows.append([today_str, time_str, regime_label, atype,
+                                 str(r["代號"]), tv, sv, target])
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+            print(f"  Google Sheets 寫入 {len(rows)} 筆行動紀錄")
+        else:
+            print("  今日無行動紀錄需寫入")
+    except Exception as e:
+        print(f"  Google Sheets 寫入失敗（略過）：{e}")
+
 def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
     try:
         import openpyxl
@@ -1263,6 +1306,12 @@ def main():
 
     print("寫入每日訊號紀錄...")
     _append_signals_to_excel(filtered_tw, filtered_otc, today_str)
+
+    print("寫入 Google Sheets 行動紀錄...")
+    _REGIME_LABEL = {"bull": "多頭", "caution": "過渡期", "bear": "空頭", "unknown": "未知"}
+    _append_action_to_gsheet(filtered_tw, filtered_otc, today_str,
+                             datetime.now().strftime("%H:%M"),
+                             _REGIME_LABEL.get(regime, "未知"))
 
     print(f"[{datetime.now():%H:%M:%S}] 完成")
 
