@@ -753,6 +753,28 @@ def scan_stocks(codes, bench_df, sector_map, suffix=".TW", revenue_dict=None):
     print()
     return pd.DataFrame(results)
 
+# ── 排序輔助 ──────────────────────────────────────────────────────────────────
+def _sort_ops(df):
+    _RANK = {"可買": 0, "條件未足": 1, "等突破": 2, "等待進場": 3}
+    def _tdist(row):
+        try:
+            tv = float(str(row.get("觸發價", "0")))
+            c  = float(row.get("收盤價", 0))
+            return (tv - c) / tv if tv > 0 else 1.0
+        except Exception:
+            return 1.0
+    df = df.copy()
+    df["_rank"]   = df["操作"].map(_RANK).fillna(9)
+    df["_dist"]   = df.apply(_tdist, axis=1)
+    _consec = pd.to_numeric(df["連買天"], errors="coerce").fillna(0) \
+              if "連買天" in df.columns else pd.Series(0, index=df.index)
+    df["_key2"] = df.apply(
+        lambda r: r["_dist"] if r["操作"] == "等突破" else -_consec[r.name], axis=1
+    )
+    return df.sort_values(["_rank", "_key2", "分數"], ascending=[True, True, False]) \
+             .drop(columns=["_rank", "_dist", "_key2"])
+
+
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
 def _build_table_html(df, header_color="#2c3e50"):
     cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
@@ -895,7 +917,8 @@ def main():
         filtered_tw = result_tw[
             (result_tw["分數"] >= MIN_SCORE) &
             (result_tw["操作"].isin(_SHOW_OPS))
-        ].sort_values(["連買天", "分數"], ascending=[False, False]).head(TOP_N).copy()
+        ]
+        filtered_tw = _sort_ops(filtered_tw).head(TOP_N).copy()
         print(f"  上市符合（分數≥{MIN_SCORE}）：{len(filtered_tw)} 支")
 
     # 上櫃：獨立門檻，依分數排序，TOP N
@@ -904,7 +927,8 @@ def main():
         filtered_otc = result_two[
             (result_two["分數"] >= MIN_SCORE_OTC) &
             (result_two["操作"].isin(_SHOW_OPS))
-        ].sort_values("分數", ascending=False).head(TOP_N).copy()
+        ]
+        filtered_otc = _sort_ops(filtered_otc).head(TOP_N).copy()
         print(f"  上櫃符合（分數≥{MIN_SCORE_OTC}）：{len(filtered_otc)} 支")
 
     today_str = datetime.now().strftime("%Y-%m-%d")
