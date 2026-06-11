@@ -611,9 +611,9 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         if _adx < 20:
             action = "等待進場"
     # 多訊號確認：黃金交叉需搭配至少 1 個輔助訊號
+    _vol_avg = df["Volume"].tail(20).mean()
+    _vol_ratio = float(latest["Volume"]) / float(_vol_avg) if pd.notna(_vol_avg) and float(_vol_avg) > 0 else 0.0
     if action == "可買":
-        _vol_avg = df["Volume"].tail(20).mean()
-        _vol_ratio = float(latest["Volume"]) / float(_vol_avg) if pd.notna(_vol_avg) and float(_vol_avg) > 0 else 0
         _rsi_5d_min = float(df["RSI14"].tail(5).min()) if "RSI14" in df.columns else 50
         _aux = 0
         if _vol_ratio >= 1.5:                                    _aux += 1
@@ -658,6 +658,7 @@ def _analyze_one(code, stock_df, bench_df=None, sector="—", revenue_yoy=None):
         "型態": "、".join(patterns) if patterns else "—",
         "月營收YoY": f"{revenue_yoy:+.0f}%" if revenue_yoy is not None else "—",
         "觸發價": f"{trigger:.1f}" if trigger is not None else "—",
+        "量/20MA": round(_vol_ratio, 2),
     }
 
 # ── MOPS 重大公告監控 ─────────────────────────────────────────────────────────
@@ -752,6 +753,91 @@ def scan_stocks(codes, bench_df, sector_map, suffix=".TW", revenue_dict=None):
                 continue
     print()
     return pd.DataFrame(results)
+
+TRADE_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "交易紀錄.xlsx")
+
+def _append_signals_to_excel(filtered_tw, filtered_otc, today_str):
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+
+        SIGNAL_COLS  = ["日期", "市場", "代號", "操作", "分數", "收盤價", "觸發價", "量/20MA", "月營收YoY", "型態", "連掃天"]
+        TRADE_COLS   = ["代號", "股名", "進場日", "進場價", "張數", "停損價", "目標價", "出場日", "出場價", "出場原因", "損益(元)", "損益(%)", "備注"]
+        COL_WIDTHS_T = [8, 12, 12, 10, 6, 10, 10, 12, 10, 14, 12, 10, 20]
+        COL_WIDTHS_S = [12, 8, 8, 12, 6, 10, 10, 10, 12, 30, 10]
+        HDR_FILL = PatternFill("solid", fgColor="1F4E79")
+        HDR_FONT = Font(color="FFFFFF", bold=True)
+        OP_COLOR = {"可買": "C6EFCE", "條件未足": "FFEB9C", "等突破": "DDEBF7", "等待進場": "F2F2F2"}
+
+        if os.path.exists(TRADE_LOG_FILE):
+            wb = openpyxl.load_workbook(TRADE_LOG_FILE)
+        else:
+            wb = openpyxl.Workbook()
+            if "Sheet" in wb.sheetnames:
+                del wb["Sheet"]
+
+        # 確保「交易紀錄」工作表存在
+        if "交易紀錄" not in wb.sheetnames:
+            ws_t = wb.create_sheet("交易紀錄", 0)
+            for i, (h, w) in enumerate(zip(TRADE_COLS, COL_WIDTHS_T), 1):
+                c = ws_t.cell(row=1, column=i, value=h)
+                c.fill, c.font = HDR_FILL, HDR_FONT
+                c.alignment = Alignment(horizontal="center")
+                ws_t.column_dimensions[get_column_letter(i)].width = w
+            ws_t.freeze_panes = "A2"
+
+        # 確保「每日訊號」工作表存在
+        if "每日訊號" not in wb.sheetnames:
+            ws_s = wb.create_sheet("每日訊號")
+            for i, (h, w) in enumerate(zip(SIGNAL_COLS, COL_WIDTHS_S), 1):
+                c = ws_s.cell(row=1, column=i, value=h)
+                c.fill, c.font = HDR_FILL, HDR_FONT
+                c.alignment = Alignment(horizontal="center")
+                ws_s.column_dimensions[get_column_letter(i)].width = w
+            ws_s.freeze_panes = "A2"
+        else:
+            ws_s = wb["每日訊號"]
+
+        # 避免重複寫入同一天
+        existing = {str(ws_s.cell(r, 1).value) for r in range(2, ws_s.max_row + 1)}
+        if today_str in existing:
+            print(f"  每日訊號：{today_str} 已存在，跳過")
+            wb.save(TRADE_LOG_FILE)
+            return
+
+        next_row = ws_s.max_row + 1
+        for market, df in [("上市", filtered_tw), ("上櫃", filtered_otc)]:
+            if df is None or df.empty:
+                continue
+            for _, row in df.iterrows():
+                op   = row.get("操作", "")
+                fill = PatternFill("solid", fgColor=OP_COLOR.get(op, "FFFFFF"))
+                vr   = row.get("量/20MA", "")
+                vr_s = f"{vr:.2f}x" if isinstance(vr, float) else str(vr)
+                vals = [
+                    today_str, market,
+                    row.get("代號", ""),
+                    op,
+                    row.get("分數", ""),
+                    row.get("收盤價", ""),
+                    row.get("觸發價", ""),
+                    vr_s,
+                    row.get("月營收YoY", ""),
+                    row.get("型態", ""),
+                    row.get("連掃天", ""),
+                ]
+                for i, val in enumerate(vals, 1):
+                    c = ws_s.cell(row=next_row, column=i, value=val)
+                    c.fill = fill
+                    c.alignment = Alignment(horizontal="center")
+                next_row += 1
+
+        wb.save(TRADE_LOG_FILE)
+        count = next_row - ws_s.max_row - 1
+        print(f"  每日訊號已寫入：{next_row - 1} 列（{TRADE_LOG_FILE}）")
+    except Exception as e:
+        print(f"  每日訊號寫入失敗：{e}")
 
 # ── 排序輔助 ──────────────────────────────────────────────────────────────────
 def _sort_ops(df):
@@ -947,6 +1033,10 @@ def main():
     print("寄送郵件...")
     total_scanned = len(codes_tw) + len(codes_two)
     send_email(filtered_tw, filtered_otc, total_scanned, mops_news=mops_news)
+
+    print("寫入每日訊號紀錄...")
+    _append_signals_to_excel(filtered_tw, filtered_otc, today_str)
+
     print(f"[{datetime.now():%H:%M:%S}] 完成")
 
 if __name__ == "__main__":
