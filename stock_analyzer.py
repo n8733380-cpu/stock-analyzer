@@ -2398,6 +2398,54 @@ with tabs[-4]:
                     ["_rank", "_key2", "分數"], ascending=[True, True, False]
                 ).drop(columns=["_rank", "_dist", "_consec", "_key2"])
 
+                # ── 今日行動卡片 ────────────────────────────────────────────
+                def _try_float(v):
+                    try: return float(str(v))
+                    except: return None
+
+                _pending = easy_df[easy_df["操作"] == "等突破"].copy()
+                _buyable = easy_df[easy_df["操作"] == "可買"].copy()
+
+                def _action_cards(df, label, bg, entry_label):
+                    rows = []
+                    for _, r in df.iterrows():
+                        tv = _try_float(r.get("觸發價"))
+                        sv = _try_float(r.get("止損價"))
+                        if tv is None: continue
+                        stop   = sv if sv is not None else round(tv * 0.98, 1)
+                        target = round(tv + (tv - stop) * 2, 1)
+                        cv = _try_float(r.get("收盤價"))
+                        if entry_label == "限買":
+                            entry_str = f"{tv:.1f}"
+                        else:
+                            entry_str = f"{cv:.1f}~{tv*1.03:.1f}" if cv and cv < tv else f"{tv:.1f}"
+                        rows.append(
+                            f"<div style='display:inline-block;background:{bg};"
+                            f"border-radius:8px;padding:10px 16px;margin:4px;min-width:220px'>"
+                            f"<div style='font-size:18px;font-weight:bold'>{r['代號']}</div>"
+                            f"<div style='font-size:13px;color:#555'>{entry_label} <b>{entry_str}</b></div>"
+                            f"<div style='font-size:13px;color:#c0392b'>停損 <b>{stop:.1f}</b></div>"
+                            f"<div style='font-size:13px;color:#27ae60'>目標 <b>{target:.1f}</b></div>"
+                            f"</div>"
+                        )
+                    return rows
+
+                has_action = not _pending.empty or not _buyable.empty
+                with st.container():
+                    st.markdown("### 今日行動")
+                    if not has_action:
+                        st.info("今日無進場訊號，建議觀望。")
+                    else:
+                        if not _pending.empty:
+                            st.markdown("**今日掛單（等突破）** — 在觸發價掛限買，突破自動成交")
+                            cards = _action_cards(_pending, "掛單", "#fff8e1", "限買")
+                            st.markdown("".join(cards), unsafe_allow_html=True)
+                        if not _buyable.empty:
+                            st.markdown("**今日可買（已突破）** — 今日可直接進場")
+                            cards = _action_cards(_buyable, "可買", "#e8f5e9", "進場")
+                            st.markdown("".join(cards), unsafe_allow_html=True)
+                    st.markdown("---")
+
                 _top_n = st.slider("顯示前幾名", 10, 50, 20, key="top_n_slider")
                 st.markdown(f"### 操作建議清單（前 {_top_n} 名）")
                 st.caption("✅可買 → ⚠️條件未足（在窗口）→ ⚡等突破（最近觸發優先）→ ⏳等待進場（純均線）｜⏭已錯過 不顯示")
