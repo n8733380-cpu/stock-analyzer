@@ -1218,6 +1218,7 @@ _BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 PAPER_FILE          = os.path.join(_BASE_DIR, "paper_trades.json")
 SCAN_HISTORY_FILE   = os.path.join(_BASE_DIR, "scan_history.json")
 SHEET_ID            = "17o-c7bQXcTk53DwRfQGESnCyxjA2owY8D7-NJzurTxQ"
+ACTION_SHEET_ID     = "1fVpgRt9BG_tFrgWIRjji0u9rCV-TsjgCRB4Vfb54w3k"
 EMPTY_TRADES        = {"positions": [], "closed": []}
 
 def _load_scan_history():
@@ -1265,6 +1266,38 @@ def _get_gsheet():
         return gc.open_by_key(SHEET_ID).sheet1
     except Exception:
         return None
+
+def _get_action_sheet():
+    """回傳行動紀錄 worksheet，失敗回傳 None"""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_info = dict(st.secrets["gcp_service_account"])
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(ACTION_SHEET_ID).worksheet("行動紀錄")
+    except Exception:
+        return None
+
+def _append_action_to_sheet(date_str, time_str, regime, records, action_type):
+    """把行動紀錄 append 到 Google Sheets，失敗靜默"""
+    ws = _get_action_sheet()
+    if ws is None:
+        return
+    try:
+        rows = [
+            [date_str, time_str, regime, action_type,
+             r["代號"], r["觸發價"], r["止損價"], r["目標"]]
+            for r in records
+        ]
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
 
 def _load_trades():
     ws = _get_gsheet()
@@ -2444,6 +2477,12 @@ with tabs[-5]:
                 }
                 with open(_AH_PATH, "w", encoding="utf-8") as _f:
                     json.dump(_ah, _f, ensure_ascii=False, indent=2)
+
+                _time_ah = _dtnow2.now().strftime("%H:%M")
+                _append_action_to_sheet(_today_ah, _time_ah, _scan_regime,
+                                        _df_to_records(_pending), "掛單")
+                _append_action_to_sheet(_today_ah, _time_ah, _scan_regime,
+                                        _df_to_records(_buyable), "可買")
 
                 _top_n = st.slider("顯示前幾名", 10, 50, 20, key="top_n_slider")
                 st.markdown(f"### 操作建議清單（前 {_top_n} 名）")
