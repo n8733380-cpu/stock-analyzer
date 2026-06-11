@@ -905,6 +905,85 @@ def _sort_ops(df):
 
 
 # ── 寄信 ─────────────────────────────────────────────────────────────────────
+def _build_action_html(df_tw, df_otc):
+    """email 最上方的今日行動區塊：今日掛單（等突破）+ 今日可買"""
+    def _fmt_row(row, action_label, entry_label):
+        code    = row.get("代號", "")
+        trigger = row.get("觸發價", "—")
+        stop    = row.get("停損價", "")
+        target  = row.get("目標價", "")
+        close   = row.get("收盤價", "")
+        # 進場價：等突破用觸發價，可買用收盤價~觸發價區間
+        try:
+            tv = float(str(trigger))
+            cv = float(close)
+            if action_label == "掛單":
+                entry_str = f"{tv:.1f}"
+            else:
+                entry_str = f"{cv:.1f}~{tv*1.03:.1f}" if cv < tv else f"{cv:.1f}"
+        except Exception:
+            entry_str = str(trigger)
+        stop_str   = f"{float(stop):.1f}"   if stop   not in ("", None) else "—"
+        target_str = f"{float(target):.1f}" if target not in ("", None) else "—"
+        bg = "#e8f5e9" if action_label == "可買" else "#fff8e1"
+        return (
+            f"<tr style='background:{bg}'>"
+            f"<td style='padding:8px 12px;font-size:15px;font-weight:bold'>{code}</td>"
+            f"<td style='padding:8px 12px;color:#555'>{entry_label} {entry_str}</td>"
+            f"<td style='padding:8px 12px;color:#c0392b'>停損 {stop_str}</td>"
+            f"<td style='padding:8px 12px;color:#27ae60'>目標 {target_str}</td>"
+            f"</tr>"
+        )
+
+    all_df = pd.concat([df for df in [df_tw, df_otc] if df is not None and not df.empty], ignore_index=True) \
+             if any(df is not None and not df.empty for df in [df_tw, df_otc]) else pd.DataFrame()
+
+    if all_df.empty:
+        return "<div style='background:#fff3cd;padding:16px;border-radius:6px;margin-bottom:20px'>" \
+               "<b>今日無進場訊號，建議觀望。</b></div>"
+
+    # 只取有觸發價的股票
+    def _has_trigger(row):
+        t = row.get("觸發價", "—")
+        try: float(str(t)); return True
+        except: return False
+
+    buyable   = all_df[(all_df["操作"] == "可買") & all_df.apply(_has_trigger, axis=1)]
+    pending   = all_df[(all_df["操作"] == "等突破") & all_df.apply(_has_trigger, axis=1)]
+
+    sections = []
+
+    if not pending.empty:
+        rows_html = "".join(_fmt_row(r, "掛單", "限買") for _, r in pending.iterrows())
+        sections.append(
+            f"<h3 style='color:#e67e22;margin:0 0 6px 0'>今日掛單（等突破）</h3>"
+            f"<p style='color:#888;font-size:12px;margin:0 0 8px 0'>"
+            f"在觸發價掛限買單，突破自動成交，不需要盯盤</p>"
+            f"<table style='border-collapse:collapse;width:100%'>{rows_html}</table>"
+        )
+
+    if not buyable.empty:
+        rows_html = "".join(_fmt_row(r, "可買", "進場") for _, r in buyable.iterrows())
+        sections.append(
+            f"<h3 style='color:#27ae60;margin:16px 0 6px 0'>今日可買（已突破）</h3>"
+            f"<p style='color:#888;font-size:12px;margin:0 0 8px 0'>"
+            f"已確認突破，今日收盤前可直接市價或限價進場</p>"
+            f"<table style='border-collapse:collapse;width:100%'>{rows_html}</table>"
+        )
+
+    if not sections:
+        return "<div style='background:#fff3cd;padding:16px;border-radius:6px;margin-bottom:20px'>" \
+               "<b>今日訊號無觸發價，無法提供進場指令，請參考下方明細。</b></div>"
+
+    inner = "".join(sections)
+    return (
+        f"<div style='background:#f8f9fa;border:2px solid #dee2e6;border-radius:8px;"
+        f"padding:16px 20px;margin-bottom:24px'>"
+        f"<h2 style='margin:0 0 12px 0;color:#2c3e50'>今日行動</h2>"
+        f"{inner}"
+        f"</div>"
+    )
+
 def _build_table_html(df, header_color="#2c3e50"):
     cols = ["分數", "代號", "產業", "操作", "收盤價", "RSI", "1M%",
             "距52高%", "RS大盤", "月營收YoY", "連買天", "外資累計(張)", "幾天前", "連掃天", "觸發價", "型態"]
@@ -972,9 +1051,12 @@ def send_email(df_tw, df_otc, total_scanned, mops_news=None):
 <tbody>{mops_rows}</tbody>
 </table>"""
 
+    action_html = _build_action_html(df_tw, df_otc)
+
     html = f"""<html><body style='font-family:Arial,sans-serif;padding:20px'>
 <h2 style='color:#2c3e50'>台股每日掃描 — {today}</h2>
-<p>掃描 {total_scanned} 支股票 | 上市 {n_tw} 支（分數≥{MIN_SCORE}，依連買天排序）/ 上櫃 {n_otc} 支（分數≥{MIN_SCORE_OTC}，依分數排序）</p>
+<p style='color:#666'>掃描 {total_scanned} 支股票</p>
+{action_html}
 <h3 style='color:#2c3e50;margin-top:20px'>上市（TWSE）— {n_tw} 支</h3>
 {tw_html}
 <h3 style='color:#1a6b3c;margin-top:30px'>上櫃（TPEX）— {n_otc} 支</h3>
